@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.20 — 2026-05-15
+
+- **Interruptible `chrome_*` tools.** All `chrome_*` tools now honor the agent harness `AbortSignal`, so pressing Esc aborts in-flight bridge calls (including the long-polling `chrome_wait_for`) immediately instead of waiting out the full `timeoutMs`.
+
 ## 0.15.19 — 2026-05-14
 
 - **Simpler package description.** README hero and npm/pi.dev description now use the same concise authorization-focused sentence.

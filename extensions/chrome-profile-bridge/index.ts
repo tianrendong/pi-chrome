@@ -237,32 +237,58 @@ class ChromeProfileBridge {
 		this.mode = undefined;
 	}
 
-	send(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
-		if (this.mode === "client") return this.sendViaOwner(action, params, timeoutMs);
-		return this.sendLocal(action, params, timeoutMs);
+	send(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
+		if (this.mode === "client") return this.sendViaOwner(action, params, timeoutMs, signal);
+		return this.sendLocal(action, params, timeoutMs, signal);
 	}
 
-	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
+	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
 		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 		const command = { id, action, params };
 		return new Promise((resolveCommand, rejectCommand) => {
+			if (signal?.aborted) {
+				rejectCommand(new Error("Chrome command aborted"));
+				return;
+			}
+			const cleanupAbort = () => {
+				if (signal) signal.removeEventListener("abort", onAbort);
+			};
+			const onAbort = () => {
+				clearTimeout(timer);
+				this.pending.delete(id);
+				this.queue = this.queue.filter((queued) => queued.id !== id);
+				cleanupAbort();
+				rejectCommand(new Error("Chrome command aborted"));
+			};
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
 				this.queue = this.queue.filter((queued) => queued.id !== id);
+				cleanupAbort();
 				rejectCommand(
 					new Error(
 						`Timed out waiting for Chrome extension after ${timeoutMs}ms. Run /chrome onboard, then load the bundled browser-extension folder in your normal Chrome profile.`,
 					),
 				);
 			}, timeoutMs);
-			this.pending.set(id, { command, resolve: resolveCommand, reject: rejectCommand, timer });
+			this.pending.set(id, {
+				command,
+				resolve: (value) => { cleanupAbort(); resolveCommand(value); },
+				reject: (err) => { cleanupAbort(); rejectCommand(err); },
+				timer,
+			});
+			if (signal) signal.addEventListener("abort", onAbort, { once: true });
 			this.enqueue(command);
 		});
 	}
 
-	private async sendViaOwner(action: string, params: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+	private async sendViaOwner(action: string, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), timeoutMs + 2_000);
+		const forwardAbort = () => controller.abort();
+		if (signal) {
+			if (signal.aborted) controller.abort();
+			else signal.addEventListener("abort", forwardAbort, { once: true });
+		}
 		try {
 			const response = await fetch(`${this.url}/command`, {
 				method: "POST",
@@ -280,11 +306,13 @@ class ChromeProfileBridge {
 			return payload.result;
 		} catch (error) {
 			if ((error as Error).name === "AbortError") {
+				if (signal?.aborted) throw new Error("Chrome command aborted");
 				throw new Error(`Timed out waiting for shared Chrome bridge owner after ${timeoutMs}ms`);
 			}
 			throw error;
 		} finally {
 			clearTimeout(timer);
+			if (signal) signal.removeEventListener("abort", forwardAbort);
 		}
 	}
 
@@ -458,9 +486,9 @@ export default function (pi: ExtensionAPI): void {
 		}
 	};
 
-	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> => {
+	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
 		requireChromeControlAuthorized();
-		return bridge.send(action, params, timeoutMs);
+		return bridge.send(action, params, timeoutMs, signal);
 	};
 
 	// Translate the public `background` parameter (default false = visible/foreground) into the
@@ -833,9 +861,9 @@ Usage rules:
 			useDefaultProfile: Type.Optional(Type.Boolean({ description: "Ignored; existing-profile access comes from the companion Chrome extension." })),
 			headless: Type.Optional(Type.Boolean({ description: "Ignored." })),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx): Promise<ToolTextResult> {
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
 			if (params.url && bridge.connected) {
-				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS);
+				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
 				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status: bridge.status(), result } };
 			}
 			return {
@@ -869,8 +897,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend(`tab.${params.action}`, params, DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend(`tab.${params.action}`, params, DEFAULT_TIMEOUT_MS, signal);
 			if (params.action === "list") {
 				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number }>;
 				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
@@ -900,11 +928,12 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
+		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const snapshot = await authorizedBridgeSend(
 				"page.snapshot",
 				withBackground({ ...params, maxElements: params.maxElements ?? MAX_ELEMENTS }),
 				DEFAULT_TIMEOUT_MS,
+				signal,
 			);
 			return { content: [{ type: "text", text: truncateText(safeJson(snapshot)) }], details: { snapshot } };
 		},
@@ -930,8 +959,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.navigate", withBackground(params), (params.timeoutMs ?? 15_000) + 2_000);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.navigate", withBackground(params), (params.timeoutMs ?? 15_000) + 2_000, signal);
 			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json } };
 		},
 	});
@@ -954,8 +983,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const value = await authorizedBridgeSend("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const value = await authorizedBridgeSend("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			const text = value === undefined
 				? "undefined"
 				: typeof value === "string"
@@ -987,8 +1016,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.click", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const raw = await authorizedBridgeSend("page.click", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
@@ -1019,8 +1048,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.type", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const raw = await authorizedBridgeSend("page.type", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
@@ -1051,8 +1080,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const raw = await authorizedBridgeSend("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
@@ -1086,8 +1115,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.key", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const raw = await authorizedBridgeSend("page.key", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const base = `Pressed ${params.key}.`;
@@ -1111,8 +1140,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000, signal);
 			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: result as Json } };
 		},
 	});
@@ -1132,8 +1161,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.console.list", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.console.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1154,8 +1183,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.network.list", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.network.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1174,8 +1203,8 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.network.get", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.network.get", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1200,12 +1229,12 @@ Usage rules:
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
+		async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
 			const format = params.format ?? "png";
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			const result = (await authorizedBridgeSend("page.screenshot", withBackground(params), params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS)) as {
+			const result = (await authorizedBridgeSend("page.screenshot", withBackground(params), params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS, signal)) as {
 				dataUrl?: string;
 				tab?: unknown;
 				fullPage?: boolean;
@@ -1254,8 +1283,8 @@ Usage rules:
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.hover", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.hover", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Hovered ${params.uid ?? params.selector ?? `${params.x},${params.y}`}` }], details: { result: result as Json } };
 		},
 	});
@@ -1280,8 +1309,8 @@ Usage rules:
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.drag", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.drag", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Dragged from ${params.fromUid ?? params.fromSelector} to ${params.toUid ?? params.toSelector}` }], details: { result: result as Json } };
 		},
 	});
@@ -1302,8 +1331,8 @@ Usage rules:
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.tap", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.tap", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
 			return { content: [{ type: "text", text: `Tapped ${target} (touch)` }], details: { result: result as Json } };
 		},
@@ -1325,8 +1354,8 @@ Usage rules:
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.scroll", withBackground(params), DEFAULT_TIMEOUT_MS);
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.scroll", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Scrolled dy=${params.deltaY ?? 0} dx=${params.deltaX ?? 0}` }], details: { result: result as Json } };
 		},
 	});
@@ -1345,10 +1374,10 @@ Usage rules:
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx): Promise<ToolTextResult> {
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
 			const cwd = workspaceCwd(ctx);
 			const paths = params.paths.map((p) => resolve(cwd, p));
-			const result = await authorizedBridgeSend("page.upload", withBackground({ ...params, paths }), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.upload", withBackground({ ...params, paths }), DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
 		},
 	});
