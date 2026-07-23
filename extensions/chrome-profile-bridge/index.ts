@@ -759,13 +759,12 @@ export default function (pi: ExtensionAPI): void {
 		}, { triggerTurn: false });
 	};
 
-	// Close THIS session's dedicated automation window/tab. Fire-and-forget and best-effort: it
-	// must never block /quit, /reload, revoke, or session end, and the service-worker side only
-	// ever closes targets this session created itself (never user tabs/windows, never another
-	// session's target). Errors (bridge down, target already closed) are intentionally swallowed.
-	const cleanupAutomationTargetBestEffort = (): void => {
+	// Close browser resources owned by THIS session. Revoke remains fire-and-forget, while real
+	// session shutdown awaits this bounded request before stopping the bridge so a fast terminal or
+	// cmux workspace close cannot discard the cleanup command it just queued.
+	const cleanupAutomationTargetBestEffort = async (timeoutMs = 3_000): Promise<void> => {
 		const sessionKey = sessionKeyFor(sessionCtx);
-		void bridge.send("automation.cleanup", sessionKey !== undefined ? { sessionKey } : {}, 3_000).catch(() => undefined);
+		await bridge.send("automation.cleanup", sessionKey !== undefined ? { sessionKey } : {}, timeoutMs).catch(() => undefined);
 	};
 
 	const lockChromeControl = (logAction?: "revoked" | "expired"): void => {
@@ -777,8 +776,8 @@ export default function (pi: ExtensionAPI): void {
 		if (logAction && wasUsable) logChromeToolChange(logAction, { authorizedUntil: undefined });
 		chromeAuthorizedUntil = undefined;
 		persistAuth();
-		// Revoking control ends pi-chrome's automation for this session; tidy up the target we own.
-		cleanupAutomationTargetBestEffort();
+		// Revoking control ends pi-chrome's automation for this session; tidy up resources we own.
+		void cleanupAutomationTargetBestEffort();
 	};
 
 	const authSummary = (): string => {
@@ -925,17 +924,14 @@ export default function (pi: ExtensionAPI): void {
 		updateChromeStatus(ctx);
 	});
 
-	pi.on("session_shutdown", (event) => {
+	pi.on("session_shutdown", async (event) => {
 		clearAuthExpiryTimer();
 		clearCountdownInterval();
-		// Tidy up this session's dedicated automation window on real session end, but NOT on
-		// "reload": /reload tears down and re-evaluates this module while the *same* session
-		// (same sessionKey) continues, so we keep the window so it is reused, not churned. The
-		// call is fire-and-forget and runs before bridge.stop() so it never blocks shutdown.
-		// (Owner-session quit may not deliver in time since stop() closes the bridge server;
-		// that only ever leaves a clearly pi-chrome window for the user to close — never a user
-		// tab — and /chrome revoke remains the reliable, bridge-alive cleanup path.)
-		if (event?.reason !== "reload") cleanupAutomationTargetBestEffort();
+		// Keep resources across /reload because the same session continues. On a real exit, wait up
+		// to 2s for Chrome to acknowledge cleanup before stopping the bridge; previously this was
+		// fire-and-forget followed immediately by bridge.stop(), which commonly orphaned the group
+		// when cmux closed a workspace quickly.
+		if (event?.reason !== "reload") await cleanupAutomationTargetBestEffort(2_000);
 		bridge.stop();
 		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
 			delete globalState[PI_CHROME_GLOBAL_KEY];
