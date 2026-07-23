@@ -269,6 +269,54 @@ async function run() {
     ok(state.tabs.get(nav.id).windowId !== state.userWindowId, "group-fail: still used the dedicated automation window");
   }
 
+  // ===== Full session cleanup: close created tabs, preserve and ungroup adopted user tabs. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupTitle = "Pi Session: alpha";
+
+    // Explicitly driving an existing user tab adopts it into the visible session group.
+    await w.dispatch("page.navigate", {
+      url: "https://mail.google.com/inbox", targetId: String(state.userGmail.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    const adoptedGroupId = state.tabs.get(state.userGmail.id).groupId;
+    ok(adoptedGroupId >= 0, "session-cleanup: existing user tab was visibly adopted into the session group");
+
+    // tab.new reuses that user-window group before an automation target exists. It is Pi-created,
+    // so cleanup may close this tab but must never close the surrounding user window.
+    const opened = await w.dispatch("tab.new", { url: "https://pi.test/created", groupTitle, sessionKey: SK });
+    ok(opened.tab.windowId === state.userWindowId, "session-cleanup: created tab reused the adopted group window");
+
+    const cleanup = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(opened.tab.id), "session-cleanup: tab.new tab was closed");
+    ok(cleanup.closedCreatedTabs === 1, "session-cleanup: reports one separately closed created tab");
+    ok(state.windows.has(state.userWindowId), "session-cleanup: user window was preserved");
+    ok(state.tabs.has(state.userGmail.id), "session-cleanup: adopted user tab was preserved");
+    ok(state.tabs.get(state.userGmail.id).groupId === -1, "session-cleanup: adopted user tab was ungrouped");
+    ok(cleanup.ungroupedAdoptedTabs === 1, "session-cleanup: reports one ungrouped adopted tab");
+    ok(state.tabs.has(state.userArticle.id), "session-cleanup: unrelated user tab was untouched");
+  }
+
+  // ===== Session resources survive a service-worker restart and still clean up safely. =====
+  {
+    const state = makeChromeState();
+    const groupTitle = "Pi Session: alpha";
+    const w1 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const opened = await w1.dispatch("tab.new", { url: "https://pi.test/persist-created", groupTitle, sessionKey: SK });
+    await w1.dispatch("page.navigate", {
+      url: "https://example.com/adopted", targetId: String(state.userArticle.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    ok(typeof state.storage.piChromeSessionResources === "object", "resource-restart: session resources were persisted");
+
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    await w2.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(opened.tab.id), "resource-restart: persisted created tab was closed after restart");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.get(state.userArticle.id).groupId === -1, "resource-restart: adopted user tab survived and was ungrouped after restart");
+    ok(!(SK in (state.storage.piChromeSessionResources || {})), "resource-restart: persisted session resources were cleared");
+  }
+
   // ===== Concurrency: two sessions get separate windows; cleanup is per-session. =====
   {
     const state = makeChromeState();

@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## Unreleased
+
+- **Reliable per-session cleanup.** Real session shutdown now waits briefly for Chrome cleanup before stopping the bridge, preventing fast terminal/workspace closes from discarding the queued cleanup command. Cleanup also closes every tab created by that Pi session while preserving existing user tabs and only removing those tabs from the Pi session group.
+
 ## 0.15.40 — 2026-06-22
 
 - **Automation targets reuse the session tab group.** When `chrome_navigate` / implicit page actions create a new pi-chrome automation tab, it is now created in this session's existing tab-group window when possible and joins that same group, avoiding duplicate same-title `Pi Session: ...` groups.

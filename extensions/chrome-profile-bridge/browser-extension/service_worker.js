@@ -27,8 +27,13 @@ let polling = false;
 // storage.session is cleared on browser restart; any window restored by Chrome's session-restore
 // is then untracked and simply left alone (we only ever close ids we still recognize as ours).
 const automationTargets = new Map(); // sessionKey -> { windowId?: number, tabId: number }
+// Tabs created by tab.new are safe to close at session end. Existing user tabs that Pi merely
+// adopted into its group are never closed; cleanup only ungroups them if they are still in the
+// exact group Pi placed them in. Persist both sets across MV3 service-worker restarts.
+const sessionResources = new Map(); // sessionKey -> { createdTabIds: Set<number>, adoptedTabs: Map<tabId, groupId> }
 const DEFAULT_SESSION_KEY = "__default__";
 const AUTOMATION_STORAGE_KEY = "piChromeAutomationTargets";
+const SESSION_RESOURCES_STORAGE_KEY = "piChromeSessionResources";
 let automationHydrated = false;
 
 function sessionKeyOf(params) {
@@ -56,6 +61,22 @@ async function hydrateAutomationTargets() {
         }
       }
     }
+    const storedResources = await chrome.storage?.session?.get?.(SESSION_RESOURCES_STORAGE_KEY);
+    const savedResources = storedResources && storedResources[SESSION_RESOURCES_STORAGE_KEY];
+    if (savedResources && typeof savedResources === "object") {
+      for (const [key, value] of Object.entries(savedResources)) {
+        if (!value || typeof value !== "object") continue;
+        const createdTabIds = new Set(
+          Array.isArray(value.createdTabIds) ? value.createdTabIds.filter((id) => typeof id === "number") : [],
+        );
+        const adoptedTabs = new Map(
+          Array.isArray(value.adoptedTabs)
+            ? value.adoptedTabs.filter((pair) => Array.isArray(pair) && typeof pair[0] === "number" && typeof pair[1] === "number")
+            : [],
+        );
+        if (createdTabIds.size || adoptedTabs.size) sessionResources.set(key, { createdTabIds, adoptedTabs });
+      }
+    }
   } catch {
     // Ignore: treat as "no persisted state".
   }
@@ -71,6 +92,46 @@ async function persistAutomationTargets() {
   } catch {
     // Ignore: persistence is an optimization, not a correctness requirement.
   }
+}
+
+async function persistSessionResources() {
+  try {
+    const obj = {};
+    for (const [key, value] of sessionResources) {
+      obj[key] = {
+        createdTabIds: [...value.createdTabIds],
+        adoptedTabs: [...value.adoptedTabs],
+      };
+    }
+    await chrome.storage?.session?.set?.({ [SESSION_RESOURCES_STORAGE_KEY]: obj });
+  } catch {
+    // Ignore: persistence is an optimization, not a correctness requirement.
+  }
+}
+
+function resourcesFor(sessionKey) {
+  let resources = sessionResources.get(sessionKey);
+  if (!resources) {
+    resources = { createdTabIds: new Set(), adoptedTabs: new Map() };
+    sessionResources.set(sessionKey, resources);
+  }
+  return resources;
+}
+
+async function trackCreatedTab(sessionKey, tabId) {
+  await hydrateAutomationTargets();
+  resourcesFor(sessionKey).createdTabIds.add(tabId);
+  await persistSessionResources();
+}
+
+function isSessionCreatedTab(sessionKey, tabId) {
+  return sessionResources.get(sessionKey)?.createdTabIds.has(tabId) === true;
+}
+
+async function trackAdoptedTab(sessionKey, tabId, groupId) {
+  await hydrateAutomationTargets();
+  resourcesFor(sessionKey).adoptedTabs.set(tabId, groupId);
+  await persistSessionResources();
 }
 
 // True if `tabId` is a pi-chrome-owned automation tab. Pass `sessionKey` to check a specific
@@ -163,6 +224,34 @@ async function cleanupAutomationTarget(sessionKey) {
     }
   }
   return { closedWindowId: null, closedTabId: null };
+}
+
+// Clean up every browser resource that belongs to one Pi session. Created tabs are closed. Existing
+// user tabs are preserved and only ungrouped when they are still in the exact group Pi assigned.
+async function cleanupSessionResources(sessionKey) {
+  await hydrateAutomationTargets();
+  const resources = sessionResources.get(sessionKey);
+  sessionResources.delete(sessionKey);
+  await persistSessionResources();
+
+  const automation = await cleanupAutomationTarget(sessionKey);
+  let closedCreatedTabs = 0;
+  let ungroupedAdoptedTabs = 0;
+
+  for (const tabId of resources?.createdTabIds || []) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) continue;
+    await chrome.tabs.remove(tabId).catch(() => {});
+    closedCreatedTabs++;
+  }
+  for (const [tabId, groupId] of resources?.adoptedTabs || []) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.groupId !== groupId) continue;
+    await chrome.tabs.ungroup(tabId).catch(() => {});
+    ungroupedAdoptedTabs++;
+  }
+
+  return { ...automation, closedCreatedTabs, ungroupedAdoptedTabs };
 }
 
 function withTimeout(promise, ms, label, onTimeout) {
@@ -1143,7 +1232,9 @@ async function dispatch(action, params) {
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
       try {
-        return await groupTab(tab, groupTitle, params.groupColor);
+        const grouped = await groupTab(tab, groupTitle, params.groupColor);
+        await trackCreatedTab(sessionKeyOf(params), tab.id);
+        return grouped;
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
         throw error;
@@ -1256,9 +1347,9 @@ async function dispatch(action, params) {
       return { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
     }
     case "automation.cleanup":
-      // Close only THIS session's pi-chrome-owned window/tab. Never touches user tabs/windows or
-      // another Pi session's target.
-      return cleanupAutomationTarget(sessionKeyOf(params));
+      // Close this session's owned automation target and tabs created by tab.new. Existing user
+      // tabs Pi adopted into the session group are preserved and only ungrouped.
+      return cleanupSessionResources(sessionKeyOf(params));
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1345,18 +1436,27 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
   // another Pi session) already grouped, since groupTab would otherwise rename that group.
   if (params.joinSessionGroup && params.sessionGroupTitle) {
-    await joinSessionGroup(tab, params.sessionGroupTitle);
+    await joinSessionGroup(tab, params.sessionGroupTitle, sessionKeyOf(params));
   }
   return tab;
 }
 
 // Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
-// No-op when the tab is already grouped or tabGroups is unavailable.
-async function joinSessionGroup(tab, title) {
+// No-op when the tab is already grouped or tabGroups is unavailable. Existing user tabs are
+// recorded as adopted so session cleanup can ungroup — but never close — them.
+async function joinSessionGroup(tab, title, sessionKey) {
   if (!chrome.tabGroups || typeof tab.id !== "number") return;
   if (typeof tab.groupId === "number" && tab.groupId >= 0) return;
   try {
-    await groupTab(tab, title);
+    const grouped = await groupTab(tab, title);
+    const groupId = grouped?.group?.id;
+    if (
+      typeof groupId === "number" &&
+      !isPiChromeOwnedTarget(tab.id, sessionKey) &&
+      !isSessionCreatedTab(sessionKey, tab.id)
+    ) {
+      await trackAdoptedTab(sessionKey, tab.id, groupId);
+    }
   } catch {
     // Grouping is best-effort; never block the actual page action on a grouping failure.
   }
