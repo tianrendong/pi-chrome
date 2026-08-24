@@ -45,7 +45,7 @@ function makeChromeState() {
 
   // Seed a user window with two real user tabs (Gmail + a research article, the active one).
   const userWindowId = alloc.window();
-  windows.set(userWindowId, { id: userWindowId });
+  windows.set(userWindowId, { id: userWindowId, focused: true });
   const userGmail = { id: alloc.tab(), windowId: userWindowId, url: "https://mail.google.com/", active: false, groupId: -1 };
   const userArticle = { id: alloc.tab(), windowId: userWindowId, url: "https://example.com/research-article", active: true, groupId: -1 };
   tabs.set(userGmail.id, userGmail);
@@ -114,14 +114,22 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
     chrome.windows = {
       create: async ({ url = "about:blank", focused = false } = {}) => {
         const id = alloc.window();
-        windows.set(id, { id });
+        windows.set(id, { id, focused });
         const tab = { id: alloc.tab(), windowId: id, url, active: true, groupId: -1 };
         tabs.set(tab.id, tab);
         return { id, focused, tabs: [{ ...tab }] };
       },
       get: async (id) => { const w = windows.get(id); if (!w) throw new Error(`No window with id ${id}`); return { ...w }; },
       remove: async (id) => { windows.delete(id); for (const [tid, t] of [...tabs]) if (t.windowId === id) tabs.delete(tid); },
-      update: async () => {},
+      update: async (id, props = {}) => {
+        const w = windows.get(id);
+        if (!w) throw new Error(`No window with id ${id}`);
+        if (props.focused === true) {
+          for (const other of windows.values()) other.focused = false;
+        }
+        Object.assign(w, props);
+        return { ...w };
+      },
     };
   } else {
     chrome.windows = { update: async () => {} }; // no create/get/remove -> tab fallback path
@@ -347,6 +355,54 @@ async function run() {
     const closed = await w.dispatch("tab.close", { sessionKey: SK });
     ok(closed.closed === nav.id, "tab.close: with an owned target, closes that target");
     ok(state.tabs.has(state.userArticle.id), "tab.close: user tab still safe after closing the owned target");
+  }
+
+  // ===== Background tab management never activates or focuses Chrome implicitly. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const backgroundWindowId = state.alloc.window();
+    state.windows.set(backgroundWindowId, { id: backgroundWindowId, focused: false });
+    const groupId = state.alloc.group();
+    state.groups.set(groupId, {
+      id: groupId,
+      title: "Pi Session: alpha",
+      color: "blue",
+      collapsed: false,
+      windowId: backgroundWindowId,
+    });
+
+    const backgroundTab = await w.dispatch("tab.new", {
+      url: "https://pi.test/background-tab",
+      foreground: false,
+      groupTitle: "Pi Session: alpha",
+      sessionKey: SK,
+    });
+    ok(backgroundTab.tab.active === false, "background tab.new: created tab remains inactive");
+    ok(state.windows.get(backgroundWindowId).focused === false, "background tab.new: leaves its background window unfocused");
+
+    const foregroundTab = await w.dispatch("tab.new", {
+      url: "https://pi.test/foreground-tab",
+      foreground: true,
+      groupTitle: "Pi Session: alpha",
+      sessionKey: SK,
+    });
+    ok(foregroundTab.tab.active === true, "foreground tab.new: explicit foreground activates the new tab");
+    ok(state.windows.get(backgroundWindowId).focused === true, "foreground tab.new: explicit foreground focuses the containing window");
+
+    await throwsWith(
+      () => w.dispatch("tab.activate", { targetId: String(state.userArticle.id), foreground: false, sessionKey: SK }),
+      /requires foreground|background mode/i,
+      "background tab.activate: refuses to focus Chrome implicitly",
+    );
+    await throwsWith(
+      () => w.dispatch("page.screenshot", { targetId: String(state.userGmail.id), foreground: false, hardBackground: true, sessionKey: SK }),
+      /requires foreground|background mode/i,
+      "hard background screenshot: refuses to activate an inactive tab",
+    );
+    ok(state.userArticle.active === true && state.userGmail.active === false, "hard background screenshot: leaves the active user tab unchanged");
+    const activated = await w.dispatch("tab.activate", { targetId: String(state.userArticle.id), foreground: true, sessionKey: SK });
+    ok(activated.active === true, "foreground tab.activate: explicit foreground still activates the requested tab");
   }
 
   // ===== Explicit targeting still works on any existing tab (no regression). =====
