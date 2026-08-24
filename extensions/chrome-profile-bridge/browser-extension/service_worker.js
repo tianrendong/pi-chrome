@@ -1139,7 +1139,10 @@ async function dispatch(action, params) {
       // tab best-effort before surfacing the error so tab.new never leaves an ungrouped Pi tab.
       const groupTitle = params.groupTitle || "Pi";
       const existingGroup = await findGroupRecordByTitle(groupTitle);
-      const createParams = { url: params.url || "about:blank", active: true };
+      // Background tab creation must not activate the new tab. `foreground` is supplied by the
+      // Pi extension's background policy; omitted preserves the historical active-tab behavior
+      // for direct bridge callers and older clients.
+      const createParams = { url: params.url || "about:blank", active: params.foreground !== false };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
       try {
@@ -1150,6 +1153,9 @@ async function dispatch(action, params) {
       }
     }
     case "tab.activate": {
+      if (params.foreground === false) {
+        throw new Error("tab.activate requires foreground mode; pass background=false or run /chrome background off");
+      }
       // Management actions never auto-create an automation target (createOwnedTarget:false): with
       // no explicit target they act on an owned target if one exists, else error — they must never
       // fall back to (or spawn a tab just to touch) the user's active tab.
@@ -1645,6 +1651,12 @@ function waitForTabComplete(tabId, timeoutMs) {
 
 async function takeScreenshot(params) {
   const tab = await getTabByParams(params);
+  if (params.hardBackground && params.foreground) {
+    throw new Error("chrome_screenshot cannot foreground a tab while hard background mode is locked");
+  }
+  if (params.hardBackground && !tab.active) {
+    throw new Error("chrome_screenshot requires foreground mode for an inactive tab; run /chrome background unlock first");
+  }
   if (params.foreground) await bringToFront(tab);
   let previousActiveId;
   if (!tab.active) {

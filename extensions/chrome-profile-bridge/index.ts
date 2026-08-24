@@ -5,6 +5,14 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 
+const { resolveChromeBackground } = require("./background-policy.cjs") as {
+	resolveChromeBackground: (
+		params: Record<string, unknown>,
+		backgroundDefault: boolean,
+		backgroundLocked: boolean,
+	) => Record<string, unknown>;
+};
+
 /**
  * Existing-profile Chrome bridge for pi.
  *
@@ -686,6 +694,8 @@ export default function (pi: ExtensionAPI): void {
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = true;
+	let backgroundLocked = false;
+	let backgroundDefaultBeforeLock: boolean | undefined;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	// Restore an authorization that survived a /reload. Drop it if it already expired.
 	const persistedAuth = globalState[PI_CHROME_AUTH_KEY];
@@ -897,17 +907,9 @@ export default function (pi: ExtensionAPI): void {
 
 	// Translate the public `background` parameter (default on = silent/background) into the
 	// service worker's wire-level `foreground` flag, accepting legacy `foreground` as a fallback.
-	const withBackground = <T extends Record<string, unknown>>(params: T): T => {
-		const typed = params as { background?: boolean; foreground?: boolean };
-		const explicit =
-			typed.background !== undefined
-				? typed.background
-				: typed.foreground !== undefined
-					? !typed.foreground
-					: undefined;
-		const background = explicit ?? backgroundDefault;
-		return { ...params, foreground: !background } as T;
-	};
+	// A hard background lock intentionally ignores per-call foreground overrides.
+	const withBackground = <T extends Record<string, unknown>>(params: T): T =>
+		({ ...resolveChromeBackground(params, backgroundDefault, backgroundLocked), hardBackground: backgroundLocked }) as T;
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionCtx = ctx;
@@ -1038,10 +1040,12 @@ Usage rules:
 		ctx.ui.notify(lines.join("\n"), "info");
 	};
 
-	// Run-in-background (Chrome focus) handler. No args = toggle. Explicit on/off/status.
+	// Run-in-background (Chrome focus) handler. No args = toggle. Explicit on/off/lock/unlock/status.
 	const BACKGROUND_DESC: Record<string, string> = {
 		on: "pi-chrome runs in the background; Chrome won't pop up or steal focus.",
 		off: "Chrome pops to the front and switches tabs so you can watch what pi-chrome is doing.",
+		lock: "Hard background mode ignores per-call foreground overrides and refuses direct tab activation.",
+		unlock: "Hard background mode is disabled; the normal background/watch setting applies.",
 	};
 
 	const backgroundHandler = async (ctx: ExtensionContext, args: string) => {
@@ -1049,7 +1053,27 @@ Usage rules:
 		const currentLabel = backgroundDefault ? "on" : "off";
 
 		if (arg === "status") {
-			ctx.ui.notify(`Run in background is ${currentLabel}. ${BACKGROUND_DESC[currentLabel]}`, "info");
+			const lockLabel = backgroundLocked ? " Hard background lock is on." : "";
+			ctx.ui.notify(`Run in background is ${currentLabel}.${lockLabel} ${BACKGROUND_DESC[currentLabel]}`, "info");
+			return;
+		}
+
+		if (arg === "lock") {
+			if (!backgroundLocked) backgroundDefaultBeforeLock = backgroundDefault;
+			backgroundDefault = true;
+			backgroundLocked = true;
+			ctx.ui.notify(`Hard background mode enabled. ${BACKGROUND_DESC.lock}`, "info");
+			return;
+		}
+		if (arg === "unlock") {
+			backgroundLocked = false;
+			if (backgroundDefaultBeforeLock !== undefined) backgroundDefault = backgroundDefaultBeforeLock;
+			backgroundDefaultBeforeLock = undefined;
+			ctx.ui.notify(`Hard background mode disabled. ${BACKGROUND_DESC.unlock}`, "info");
+			return;
+		}
+		if (backgroundLocked && (arg === "off" || arg === "false" || arg === "0" || arg === "toggle" || arg === "")) {
+			ctx.ui.notify("Hard background mode is on. Run /chrome background unlock before switching to foreground mode.", "warning");
 			return;
 		}
 
@@ -1057,7 +1081,7 @@ Usage rules:
 		else if (arg === "off" || arg === "false" || arg === "0") backgroundDefault = false;
 		else if (arg === "toggle" || arg === "") backgroundDefault = !backgroundDefault;
 		else {
-			ctx.ui.notify(`Unknown background setting '${arg}'. Pick one of: on | off | toggle | status.`, "warning");
+			ctx.ui.notify(`Unknown background setting '${arg}'. Pick one of: on | off | lock | unlock | toggle | status.`, "warning");
 			return;
 		}
 
@@ -1144,7 +1168,7 @@ Usage rules:
 			parts.push(`✗ Chrome not responding`);
 		}
 		parts.push(`auth: ${authSummary()}`);
-		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);
+		parts.push(`background: ${backgroundDefault ? "on" : "off"}${backgroundLocked ? " (locked)" : ""}`);
 		return parts.join(" · ");
 	};
 
@@ -1179,11 +1203,15 @@ Usage rules:
 		const choice = await ctx.ui.select("Background / watch mode", [
 			"Use Chrome in background",
 			"Use Chrome in foreground",
+			"Lock background mode",
+			"Unlock background mode",
 		]);
 		if (!choice) return;
 		switch (choice) {
 			case "Use Chrome in background": return backgroundHandler(ctx, "on");
 			case "Use Chrome in foreground": return backgroundHandler(ctx, "off");
+			case "Lock background mode": return backgroundHandler(ctx, "lock");
+			case "Unlock background mode": return backgroundHandler(ctx, "unlock");
 		}
 	};
 
@@ -1210,7 +1238,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|lock|unlock|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1244,8 +1272,10 @@ Usage rules:
 				candidates = [
 					{ fullValue: "background on", label: "on", description: "Run in background. Chrome stays in the background. Your editor keeps focus. (default)" },
 					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch." },
+					{ fullValue: "background lock", label: "lock", description: "Prevent tool calls from overriding background mode." },
+					{ fullValue: "background unlock", label: "unlock", description: "Allow the normal background/watch setting again." },
 					{ fullValue: "background toggle", label: "toggle", description: "Flip whichever way it's currently set." },
-					{ fullValue: "background status", label: "status", description: "Show the current setting." },
+					{ fullValue: "background status", label: "status", description: "Show the current setting and lock state." }
 				];
 			}
 			if (candidates.length === 0) return null;
@@ -1290,18 +1320,19 @@ Usage rules:
 		name: "chrome_launch",
 		label: "Chrome Bridge Setup",
 		description:
-			"Start/check the local bridge used by the companion Chrome extension. This does not launch a separate Chrome profile; install the unpacked Chrome extension in your existing Chrome profile to connect.",
+			"Start/check the local bridge used by the companion Chrome extension. This does not launch a separate Chrome profile; install the unpacked Chrome extension in your existing Chrome profile to connect. If url is provided, the new tab stays inactive in background mode; pass background=false or run /chrome background off to foreground it.",
 		promptSnippet: "Show instructions for connecting Pi to the user's existing Chrome profile via the companion extension.",
 		parameters: Type.Object({
 			port: Type.Optional(Type.Number({ description: "Ignored. The bundled Chrome extension polls 127.0.0.1:17318." })),
 			url: Type.Optional(Type.String({ description: "Optional URL to open in the existing Chrome profile after the extension is connected." })),
+			background: Type.Optional(Type.Boolean({ description: "If true (the default), open the URL without activating the new tab. Pass false to foreground it." })),
 			userDataDir: Type.Optional(Type.String({ description: "Ignored. This bridge intentionally uses the user's existing Chrome profile through the companion extension." })),
 			useDefaultProfile: Type.Optional(Type.Boolean({ description: "Ignored; existing-profile access comes from the companion Chrome extension." })),
 			headless: Type.Optional(Type.Boolean({ description: "Ignored." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
 			if (params.url && bridge.connected) {
-				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
+				const result = await authorizedBridgeSend("tab.new", withBackground({ ...params, url: params.url }), DEFAULT_TIMEOUT_MS, signal);
 				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status: bridge.status(), result } };
 			}
 			return {
@@ -1326,7 +1357,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group and stay inactive in background mode. activate requires foreground mode; close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -1337,10 +1368,14 @@ Usage rules:
 			group: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Pi-created tabs always join this session's own tab group." })),
 			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so one Pi session uses one tab group ('Pi Session: <name-or-id>')." })),
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
+			background: Type.Optional(Type.Boolean({ description: "If true (the default), new tabs stay inactive. Pass false to activate a new tab or use tab.activate." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			if (params.action === "activate" && backgroundLocked) {
+				throw new Error("tab.activate is disabled while hard background mode is locked; run /chrome background unlock first");
+			}
 			const forwarded = { ...params } as typeof params & { groupTitle?: string };
 			// Force every Pi-opened/explicitly-grouped tab into this session's own group,
 			// named after the session display name (falling back to the session id). There is
@@ -1348,7 +1383,7 @@ Usage rules:
 			if (params.action === "new" || params.action === "group") {
 				forwarded.groupTitle = sessionGroupTitle(ctx);
 			}
-			const result = await authorizedBridgeSend(`tab.${params.action}`, forwarded, DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend(`tab.${params.action}`, withBackground(forwarded), DEFAULT_TIMEOUT_MS, signal);
 			if (params.action === "list") {
 				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string } | null }>;
 				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
@@ -1672,11 +1707,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: "If true (the default), wait silently without focusing Chrome. Pass false to focus Chrome so the user can watch." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000, signal);
+			const result = await authorizedBridgeSend("page.waitFor", withBackground(params), (params.timeoutMs ?? 10_000) + 2_000, signal);
 			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: result as Json } };
 		},
 	});

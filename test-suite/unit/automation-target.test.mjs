@@ -349,6 +349,42 @@ async function run() {
     ok(state.tabs.has(state.userArticle.id), "tab.close: user tab still safe after closing the owned target");
   }
 
+  // ===== Background tab management never activates or focuses Chrome implicitly. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+
+    const backgroundTab = await w.dispatch("tab.new", {
+      url: "https://pi.test/background-tab",
+      foreground: false,
+      groupTitle: "Pi Session: alpha",
+      sessionKey: SK,
+    });
+    ok(backgroundTab.tab.active === false, "background tab.new: created tab remains inactive");
+
+    const foregroundTab = await w.dispatch("tab.new", {
+      url: "https://pi.test/foreground-tab",
+      foreground: true,
+      groupTitle: "Pi Session: alpha",
+      sessionKey: SK,
+    });
+    ok(foregroundTab.tab.active === true, "foreground tab.new: explicit foreground activates the new tab");
+
+    await throwsWith(
+      () => w.dispatch("tab.activate", { targetId: String(state.userArticle.id), foreground: false, sessionKey: SK }),
+      /requires foreground|background mode/i,
+      "background tab.activate: refuses to focus Chrome implicitly",
+    );
+    await throwsWith(
+      () => w.dispatch("page.screenshot", { targetId: String(state.userGmail.id), foreground: false, hardBackground: true, sessionKey: SK }),
+      /requires foreground|background mode/i,
+      "hard background screenshot: refuses to activate an inactive tab",
+    );
+    ok(state.userArticle.active === true && state.userGmail.active === false, "hard background screenshot: leaves the active user tab unchanged");
+    const activated = await w.dispatch("tab.activate", { targetId: String(state.userArticle.id), foreground: true, sessionKey: SK });
+    ok(activated.active === true, "foreground tab.activate: explicit foreground still activates the requested tab");
+  }
+
   // ===== Explicit targeting still works on any existing tab (no regression). =====
   {
     const state = makeChromeState();

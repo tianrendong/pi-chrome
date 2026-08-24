@@ -48,9 +48,11 @@ By default, chrome calls run in background so Chrome does not steal focus.
 ```text
 /chrome background on       # background mode
 /chrome background off      # foreground/watch mode
+/chrome background lock     # hard background mode
+/chrome background unlock   # restore normal override behavior
 ```
 
-Per-call `background: false` brings Chrome forward for that action. Per-call `background: true` forces background.
+In normal mode, per-call `background: false` brings Chrome forward for that action and `background: true` forces background. Hard background mode ignores per-call foreground overrides, keeps new tabs inactive, refuses direct tab activation, and rejects screenshots of inactive tabs rather than switching Chrome to capture them.
 
 ## Authorization
 

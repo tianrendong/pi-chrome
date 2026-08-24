@@ -70,7 +70,7 @@ Second doctor run should show all checks passing.
 - Click, type, fill forms, scroll, drag, tap, and upload files.
 - Capture screenshots for bugs, PRs, and demos.
 - Inspect console logs and captured `fetch`/`XMLHttpRequest` responses.
-- Manage tabs without taking over your active window.
+- Manage tabs without taking over your active window. New tabs stay inactive in background mode.
 
 Tool parameters and gotchas are documented inline in Pi.
 
@@ -110,10 +110,12 @@ Security details: [`SECURITY.md`](./SECURITY.md). Architecture details: [`docs/A
 /chrome revoke
 /chrome background on       # default: don't steal focus
 /chrome background off      # foreground/watch mode
+/chrome background lock     # hard-lock background mode; ignore per-call foreground overrides
+/chrome background unlock   # restore normal background/watch behavior
 /chrome background status
 ```
 
-If loaded extension is older than installed `pi-chrome`, `/chrome doctor` tells you to reload it from `chrome://extensions`.
+Hard background mode also refuses direct tab activation and inactive-tab screenshots, and keeps URL-created tabs inactive until you run `/chrome background unlock` and explicitly choose foreground mode. If loaded extension is older than installed `pi-chrome`, `/chrome doctor` tells you to reload it from `chrome://extensions`.
 
 ---
 
