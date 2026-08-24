@@ -1145,12 +1145,17 @@ async function dispatch(action, params) {
       const createParams = { url: params.url || "about:blank", active: params.foreground !== false };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
+      let grouped;
       try {
-        return await groupTab(tab, groupTitle, params.groupColor);
+        grouped = await groupTab(tab, groupTitle, params.groupColor);
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
         throw error;
       }
+      if (params.foreground && typeof tab.id === "number") {
+        await bringToFront(await chrome.tabs.get(tab.id));
+      }
+      return grouped;
     }
     case "tab.activate": {
       if (params.foreground === false) {

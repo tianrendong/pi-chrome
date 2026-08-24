@@ -909,7 +909,7 @@ export default function (pi: ExtensionAPI): void {
 	// service worker's wire-level `foreground` flag, accepting legacy `foreground` as a fallback.
 	// A hard background lock intentionally ignores per-call foreground overrides.
 	const withBackground = <T extends Record<string, unknown>>(params: T): T =>
-		({ ...resolveChromeBackground(params, backgroundDefault, backgroundLocked), hardBackground: backgroundLocked }) as T;
+		({ ...resolveChromeBackground(params, backgroundDefault, backgroundLocked), hardBackground: backgroundLocked }) as unknown as T;
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionCtx = ctx;
@@ -1784,7 +1784,7 @@ Usage rules:
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
-			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
+			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); hard background mode rejects screenshots of inactive tabs instead of activating them. Pass background=false to focus Chrome so the user can watch.",
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
@@ -1795,7 +1795,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true (the default), capture silently without focusing the Chrome window (the target tab is briefly activated within its window for the capture, then restored); pass false to focus Chrome." }),
+				Type.Boolean({ description: "If true (the default), capture silently without focusing the Chrome window (the target tab is briefly activated within its window for the capture, then restored); hard background mode rejects inactive targets instead. Pass false to focus Chrome." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
