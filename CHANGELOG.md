@@ -1,6 +1,44 @@
 # Changelog
 
 All notable user-facing changes to `pi-chrome`.
+## 0.15.54 — 2026-09-10
+
+- **Switch the automation target URL to the companion extension's own origin.**
+  - 0.15.52 moved `about:blank` → `data:text/html,…` because `chrome.scripting.executeScript`
+    cannot inject into `about:` tabs even with `host_permissions: ["<all_urls>"]`. Live
+    verification of 0.15.52/0.15.53 against Brave showed that `data:` URLs are also rejected
+    (`Cannot access contents of url "data:text/html,…". Extension manifest must request
+    permission to access this host.`) — `data:` URLs are out of scope for extension script
+    injection regardless of the manifest pattern, so the original error resurfaced the moment
+    `chrome_snapshot` tried to drive the new tab. Same restriction on `chrome:`, `chrome-extension:`
+    (other than our own), `devtools:`, and `edge:`.
+  - Fix: point `AUTOMATION_TARGET_URL` at `chrome.runtime.getURL("ui/automation-shell.html")`,
+    a real `text/html` page shipped at `extensions/chrome-profile-bridge/browser-extension/ui/automation-shell.html`
+    with a `<title>Pi Chrome</title>` shell. Chrome's extension origin grants its own SW
+    script-injection access without any manifest entry, so `chrome.scripting.executeScript`,
+    `chrome.debugger.attach`, and `chrome_snapshot` all work against it.
+  - Survives bridge renames, multi-port installs, and bridge mode switches (server / client /
+    promote) because the URL is computed from the runtime extension id, not from the bridge.
+  - Defensive fallback to `BRIDGE_URL + "/__pi_chrome_shell"` for unit-test sandbox where
+    `chrome.runtime.getURL` may be missing.
+- **Tests.** All seven Node unit suites still pass (180+ assertions green).
+- **Companion version.** Bumped to 0.15.54 and synced by `scripts/sync-manifest-version.js`.
+
+
+## 0.15.53 — 2026-09-10
+
+- **Live connection-status toolbar badge (LED).** The companion extension now drives the toolbar action badge so the user can see the bridge connection state at a glance without opening the popup: green "on" while `/next` is succeeding, yellow "auth" on HTTP 401/403 (Pi session is not authorized), red "off" when the bridge is unreachable or has stopped responding within 4 s. A watchdog flips the badge back to red even when `/next` is silently blocking. The badge replaces the previous static "pi" badge.
+- **Companion status popup.** Clicking the toolbar action now opens a compact dark-themed status page (manifest `action.default_popup`) showing companion version, bridge URL, current state, automation target count, last success / last auth timestamp, and last error. The popup receives live updates via `chrome.runtime.connect({ name: "popup" })` and the service worker pushes a fresh snapshot on every state change. Two buttons: "Copy diagnostic" (puts a one-block summary on the clipboard) and "Doctor in Pi" (copies `/chrome doctor` for the user to paste into Pi).
+- **State machine without service-worker flicker.** Connection state is tracked by a single in-memory variable with sentinel-init so the very first paint is the red "off" badge; transitions go through `setConnectionState()` which updates the badge and broadcasts to open popup ports.
+- **Tests.** Added `test-suite/unit/badge-status.test.mjs` covering the initial badge paint, popup-port snapshot delivery, and non-popup-port rejection. All seven Node unit suites still pass (180+ assertions green).
+- **Companion version.** `extensions/chrome-profile-bridge/browser-extension/manifest.json` bumped to 0.15.53 by `scripts/sync-manifest-version.js`. Reload the companion at `chrome://extensions` after pulling.
+
+## 0.15.52 — 2026-09-10
+
+- **Automation targets no longer start at `about:blank`.** `createAutomationTarget` (used by every implicit page action — navigate, click, type, snapshot, inspect, evaluate, screenshot) now opens a `data:text/html,<!doctype html><title>Pi Chrome</title>` shell. The previous `about:blank` start URL made `chrome.scripting.executeScript` throw `Cannot access contents of url "about:blank"` from `chrome_inspect` / `chrome_snapshot` because manifest `host_permissions` cannot cover the `about:` scheme. The data URL is in-process, has a real document for the debugger to attach to, and stays injectable. Same shell opens for the window-creation and tab-fallback paths.
+- **Clearer protected-URL error.** `getTabByParams` now also rejects `about:` and `edge:` tabs (in addition to `chrome:`, `chrome-extension:`, `devtools:`) and the thrown error tells the operator to navigate the tab to an http(s) URL and retry. Previously `chrome_inspect` on a fresh user tab opened at `about:blank` surfaced the cryptic Chrome-level "Cannot access contents" message instead of a usable next step.
+- **Tests.** All six Node unit suites (`automation-target`, `csp-eval`, `session-cleanup`, `background-policy`, `input-reliability`, `chrome-command`) still pass — 169 assertions green.
+- **Companion version.** `extensions/chrome-profile-bridge/browser-extension/manifest.json` bumped to 0.15.52 by `scripts/sync-manifest-version.js`. Reload the companion at `chrome://extensions` after pulling.
 
 ## 0.15.51 — 2026-09-10
 

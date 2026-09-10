@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Pi Chrome Connector</title>
+<style>
+  /* NVIDIA green + AMOLED black palette. */
+  :root {
+    color-scheme: dark;
+
+    /* NVIDIA brand green (close to #76B900). */
+    --nv-green: #76b900;
+    --nv-green-2: #8ed420;
+    --nv-green-3: #5e9300;
+    --nv-green-glow: hsla(82, 100%, 38%, 0.45);
+
+    /* AMOLED pure black + near-black surfaces. */
+    --bg-1: #000000;            /* AMOLED base */
+    --bg-2: #050505;            /* panel */
+    --bg-3: #0a0a0a;            /* panel-elevated */
+
+    --border-1: hsla(82, 100%, 38%, 0.10);
+    --border-2: hsla(82, 100%, 38%, 0.22);
+
+    --text-1: #f5f7f0;
+    --text-2: #c2c8b8;
+    --text-3: #7d8275;
+
+    --green-9: var(--nv-green);
+    --green-3: hsla(82, 100%, 38%, 0.20);
+    --amber-9: #f5a623;
+    --amber-3: hsla(38, 92%, 55%, 0.20);
+    --red-9:   #ff3b30;
+    --red-3:   hsla(358, 75%, 60%, 0.20);
+    --grey-9:  #555a52;
+    --grey-3:  hsla(0, 0%, 30%, 0.4);
+
+    --radius-1: 4px;
+    --radius-2: 6px;
+    --radius-3: 8px;
+    --radius-4: 12px;
+
+    --shadow-1: 0 1px 2px rgba(0,0,0,0.6);
+    --shadow-2: 0 4px 16px -2px rgba(0,0,0,0.8), 0 0 0 1px var(--border-1);
+    --shadow-nv: 0 0 12px var(--nv-green-glow), 0 1px 0 hsla(0, 0%, 100%, 0.05) inset;
+
+    --font-sans: -apple-system, BlinkMacSystemFont, "Inter var", "Inter", "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 360px;
+    color: var(--text-1);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    min-height: 100vh;
+    /* AMOLED black + NVIDIA green accent washes. */
+    background:
+      radial-gradient(circle at 0% 0%, hsla(82, 100%, 38%, 0.16) 0%, transparent 45%),
+      radial-gradient(circle at 100% 100%, hsla(82, 100%, 38%, 0.10) 0%, transparent 50%),
+      #000000;
+    overflow-x: hidden;
+  }
+
+  /* Optical grid layer — fixed, sits behind everything. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+      linear-gradient(var(--border-1) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border-1) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-position: -1px -1px;
+    mask-image: radial-gradient(ellipse at 50% 30%, black 0%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse at 50% 30%, black 0%, transparent 80%);
+  }
+
+  /* Subtle scanline shimmer that drifts across the popup. */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background: linear-gradient(115deg, transparent 30%, hsla(82, 100%, 38%, 0.05) 50%, transparent 70%);
+    animation: drift 12s linear infinite;
+  }
+
+  @keyframes drift {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  .stack {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    gap: 10px;
+    padding: 14px;
+  }
+
+  /* ---------------- Header / Status ---------------- */
+
+  .header {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: var(--radius-4);
+    background:
+      linear-gradient(135deg, hsla(82, 100%, 38%, 0.10), hsla(82, 100%, 38%, 0.04)),
+      var(--bg-2);
+    border: 1px solid var(--border-2);
+    box-shadow: var(--shadow-2);
+    backdrop-filter: blur(8px);
+  }
+
+  .led-wrap {
+    position: relative;
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+  }
+
+  .led-ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    opacity: 0.5;
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  .led-ring.green  { background: var(--nv-green); box-shadow: 0 0 12px var(--nv-green); }
+  .led-ring.amber  { background: var(--amber-9);   box-shadow: 0 0 12px var(--amber-9); }
+  .led-ring.red    { background: var(--red-9);     box-shadow: 0 0 12px var(--red-9); }
+  .led-ring.grey   { background: var(--grey-9);    box-shadow: 0 0 4px var(--grey-9); animation: none; opacity: 0.35; }
+  @keyframes pulse {
+    0%, 100% { transform: scale(1);   opacity: 0.45; }
+    50%      { transform: scale(1.5); opacity: 0; }
+  }
+
+  .led-dot {
+    position: relative;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    z-index: 1;
+  }
+  .led-dot.green { background: var(--nv-green); box-shadow: 0 0 6px var(--nv-green); }
+  .led-dot.amber { background: var(--amber-9);  box-shadow: 0 0 6px var(--amber-9); }
+  .led-dot.red   { background: var(--red-9);    box-shadow: 0 0 6px var(--red-9); }
+  .led-dot.grey  { background: var(--grey-9); }
+
+  .header h1 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-1);
+  }
+  .header .subtitle {
+    margin: 0;
+    font-size: 11px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+  }
+
+  .state-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
+  }
+  .state-pill.green {
+    color: var(--nv-green);
+    background: var(--green-3);
+    border: 1px solid hsla(82, 100%, 38%, 0.32);
+  }
+  .state-pill.amber {
+    color: var(--amber-9);
+    background: var(--amber-3);
+    border: 1px solid hsla(38, 92%, 55%, 0.32);
+  }
+  .state-pill.red {
+    color: var(--red-9);
+    background: var(--red-3);
+    border: 1px solid hsla(358, 75%, 60%, 0.32);
+  }
+  .state-pill.grey {
+    color: var(--text-3);
+    background: var(--grey-3);
+    border: 1px solid var(--border-2);
+  }
+
+  /* ---------------- Card / panels ---------------- */
+
+  .panel {
+    padding: 12px 14px;
+    border-radius: var(--radius-3);
+    background:
+      linear-gradient(180deg, hsla(230, 14%, 14%, 0.6), hsla(230, 14%, 10%, 0.6)),
+      var(--bg-2);
+    border: 1px solid var(--border-1);
+    box-shadow: var(--shadow-1);
+    backdrop-filter: blur(8px);
+  }
+
+  .panel-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .panel-title::before {
+    content: "";
+    width: 3px;
+    height: 11px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--nv-green), var(--nv-green-3));
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .stat {
+    padding: 10px 12px;
+    border-radius: var(--radius-2);
+    background: var(--bg-3);
+    border: 1px solid var(--border-1);
+  }
+  .stat .label {
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .stat .value {
+    margin-top: 4px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-1);
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+  }
+  .stat .value.mono { font-family: var(--font-mono); font-size: 12px; }
+
+  /* Inline health-probe result under the Bridge URL stat. */
+  .probe {
+    margin-top: 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-3);
+    font-family: var(--font-mono);
+  }
+  .probe-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--grey-9);
+    box-shadow: 0 0 4px var(--grey-9);
+    flex-shrink: 0;
+  }
+  .probe.ok    .probe-dot { background: var(--nv-green); box-shadow: 0 0 6px var(--nv-green); }
+  .probe.warn  .probe-dot { background: var(--amber-9);  box-shadow: 0 0 6px var(--amber-9);  }
+  .probe.error .probe-dot { background: var(--red-9);    box-shadow: 0 0 6px var(--red-9);    }
+  /* ---------------- Debug accordion ---------------- */
+
+  details.debug {
+    margin-top: 10px;
+    border-radius: var(--radius-2);
+    background: var(--bg-3);
+    border: 1px solid var(--border-1);
+    overflow: hidden;
+  }
+  details.debug > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    user-select: none;
+  }
+  details.debug > summary::-webkit-details-marker { display: none; }
+  details.debug > summary::after {
+    content: "+";
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text-3);
+    transition: transform 0.18s ease;
+  }
+  details.debug[open] > summary::after { content: "−"; }
+
+  details.debug .debug-body {
+    padding: 0 12px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-2);
+    line-height: 1.6;
+    word-break: break-all;
+  }
+  details.debug .debug-body .k { color: var(--text-3); }
+  details.debug .debug-body .v { color: var(--text-1); }
+
+  /* ---------------- Footer / Buttons ---------------- */
+
+  .footer {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
+  button {
+    appearance: none;
+    /* NVIDIA-green across both action buttons. */
+    border: 1px solid var(--nv-green-3);
+    border-radius: var(--radius-2);
+    background: linear-gradient(135deg, var(--nv-green), var(--nv-green-3));
+    color: #051000;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-shadow: var(--shadow-nv);
+  }
+  button:hover {
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green));
+    border-color: var(--nv-green);
+    box-shadow: 0 0 18px var(--nv-green-glow), 0 1px 0 hsla(0, 0%, 100%, 0.08) inset;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  button.primary {
+    /* Slightly heavier gradient + bigger glow to keep a soft hierarchy between the two actions. */
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green));
+    border-color: var(--nv-green);
+    color: #051000;
+    box-shadow: 0 1px 0 hsla(0, 0%, 100%, 0.15) inset, 0 0 18px var(--nv-green-glow);
+  }
+  button.primary:hover {
+    background: linear-gradient(135deg, var(--nv-green-2), var(--nv-green-2));
+    box-shadow: 0 0 24px var(--nv-green-glow), 0 1px 0 hsla(0, 0%, 100%, 0.18) inset;
+  }
+
+  /* Inline icon helpers */
+  .icon { width: 12px; height: 12px; flex-shrink: 0; }
+
+  /* Transient toast */
+  .toast {
+    position: fixed;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    background: var(--bg-3);
+    border: 1px solid var(--border-2);
+    box-shadow: var(--shadow-2);
+    color: var(--text-1);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    z-index: 10;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+</style>
+</head>
+<body class="state-offline">
+  <div class="stack">
+
+    <header class="header">
+      <div class="led-wrap" aria-hidden="true">
+        <div class="led-ring grey" id="ledRing"></div>
+        <div class="led-dot grey" id="ledDot"></div>
+      </div>
+      <div>
+        <h1>Pi Chrome Connector</h1>
+        <p class="subtitle">v<span id="ver">—</span> · bridge <span id="bridgeShort">—</span></p>
+      </div>
+      <span class="state-pill grey" id="statePill">offline</span>
+    </header>
+
+    <section class="panel">
+      <h2 class="panel-title">Connection</h2>
+      <div class="grid-2">
+        <div class="stat">
+          <div class="label">Bridge URL</div>
+          <div class="value mono" id="bridge">—</div>
+          <div class="probe" id="bridgeProbe">
+            <span class="probe-dot" id="probeDot"></span>
+            <span class="probe-text" id="probeText">checking…</span>
+          </div>
+        </div>
+        <div class="stat">
+          <div class="label">Automation Targets</div>
+          <div class="value accent" id="targets">0</div>
+        </div>
+      </div>
+
+      <details class="debug">
+        <summary>Debug info</summary>
+        <div class="debug-body" id="debugBody"></div>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">Commands</h2>
+      <div class="footer">
+        <button id="copy">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          Copy diagnostic
+        </button>
+        <button id="doctor" class="primary">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          Doctor in Pi
+        </button>
+      </div>
+    </section>
+
+    <div class="toast" id="toast">Copied</div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const STATE = {
+      online:  { label: "online",  pill: "green", dotClass: "green", ringClass: "green"  },
+      auth:    { label: "auth",    pill: "amber", dotClass: "amber", ringClass: "amber"  },
+      offline: { label: "offline", pill: "red",   dotClass: "red",   ringClass: "red"    },
+    };
+
+    function fmtTime(ms) {
+      if (!ms) return "never";
+      const ago = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      const t = new Date(ms);
+      const hh = String(t.getHours()).padStart(2, "0");
+      const mm = String(t.getMinutes()).padStart(2, "0");
+      const ss = String(t.getSeconds()).padStart(2, "0");
+      return `${hh}:${mm}:${ss} · ${ago}s ago`;
+    }
+
+    function shortBridge(url) {
+      if (!url) return "—";
+      try {
+        const u = new URL(url);
+        return u.host;
+      } catch { return url; }
+    }
+
+    function setStateVisual(state) {
+      const meta = STATE[state] || STATE.offline;
+      document.body.className = "state-" + state;
+      $("ledDot").className = "led-dot " + meta.dotClass;
+      $("ledRing").className = "led-ring " + meta.ringClass;
+      $("statePill").className = "state-pill " + meta.pill;
+      $("statePill").textContent = meta.label;
+    }
+    function renderProbe(probe) {
+      const el = $("bridgeProbe");
+      const text = $("probeText");
+      const dot = $("probeDot");
+      el.classList.remove("ok", "warn", "error");
+      if (!probe) {
+        dot.className = "probe-dot";
+        text.textContent = "no probe yet";
+        return;
+      }
+      if (probe.ok) {
+        el.classList.add("ok");
+        text.textContent = `reachable · ${probe.status} ${probe.mode} · ${probe.latencyMs}ms`;
+      } else if (probe.error) {
+        el.classList.add("error");
+        text.textContent = `unreachable · ${probe.error}`;
+      } else {
+        el.classList.add("warn");
+        text.textContent = `HTTP ${probe.status || "?"}`;
+      }
+    }
+
+    let lastSnapshot = null;
+    function render(snapshot) {
+      lastSnapshot = snapshot;
+      const state = snapshot.state || "offline";
+      setStateVisual(state);
+      $("ver").textContent = snapshot.companionVersion || "?";
+      $("bridge").textContent = snapshot.bridgeUrl || "—";
+      $("bridgeShort").textContent = shortBridge(snapshot.bridgeUrl);
+      $("targets").textContent = String(snapshot.automationTargetCount ?? 0);
+      renderProbe(snapshot.bridgeProbe);
+
+      const dbg = $("debugBody");
+      const rows = [
+        ["companionVersion", snapshot.companionVersion],
+        ["bridgeUrl",        snapshot.bridgeUrl],
+        ["state",            snapshot.state],
+        ["automationTargets",snapshot.automationTargetCount],
+        ["lastSuccessAt",    snapshot.lastSuccessAt ? new Date(snapshot.lastSuccessAt).toISOString() : "never"],
+        ["lastAuthAt",       snapshot.lastAuthAt ? new Date(snapshot.lastAuthAt).toISOString() : "never"],
+        ["lastError",        snapshot.lastError || "(none)"],
+      ];
+      dbg.innerHTML = rows
+        .map(([k, v]) => `<div><span class="k">${k}</span> <span class="v">${escapeHtml(String(v))}</span></div>`)
+        .join("");
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function toast(msg) {
+      const el = $("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => el.classList.remove("show"), 1500);
+    }
+    let port = null;
+    // Try a one-shot sendMessage first; if the service worker is asleep this triggers a wakeup
+    // before chrome.runtime.connect succeeds. Then long-lived port for live updates.
+    function fetchOnce() {
+      try {
+        chrome.runtime.sendMessage({ type: "popup.getStatus" }, (response) => {
+          if (response && typeof response === "object") render(response);
+        });
+      } catch {}
+    }
+    function connect() {
+      try {
+        port = chrome.runtime.connect({ name: "popup" });
+        port.onMessage.addListener(render);
+        port.onDisconnect.addListener(() => {
+          port = null;
+          setTimeout(connect, 500);
+        });
+      } catch {
+        setTimeout(connect, 500);
+      }
+    }
+    fetchOnce();
+    connect();
+    // Diagnostic: surface the popup's loaded version so the user can confirm the latest
+    // status.html is in their popup cache. Falls back to '?' if chrome.runtime is missing.
+    try {
+      $("ver").textContent = chrome.runtime.getManifest().version;
+    } catch {}
+    $("copy").addEventListener("click", async () => {
+      const s = lastSnapshot || {};
+      const text = [
+        "pi-chrome status snapshot",
+        "  state:              " + (s.state || "offline"),
+        "  companionVersion:   " + (s.companionVersion || "?"),
+        "  bridgeUrl:          " + (s.bridgeUrl || "?"),
+        "  automationTargets:  " + (s.automationTargetCount ?? 0),
+        "  lastSuccessAt:      " + (s.lastSuccessAt ? new Date(s.lastSuccessAt).toISOString() : "never"),
+        "  lastAuthAt:         " + (s.lastAuthAt ? new Date(s.lastAuthAt).toISOString() : "never"),
+        "  lastError:          " + (s.lastError || "(none)"),
+      ].join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("Copied diagnostic");
+      } catch {
+        toast("Copy failed");
+      }
+    });
+
+    $("doctor").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText("/chrome doctor");
+        toast("Copied — paste in Pi");
+      } catch {
+        toast("Copy failed");
+      }
+    });
+  </script>
+</body>
+</html>
