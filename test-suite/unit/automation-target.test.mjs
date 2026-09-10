@@ -1,10 +1,12 @@
-// Unit harness for pi-chrome's dedicated automation tab/window isolation in service_worker.js.
+// Unit harness for pi-chrome's dedicated automation tab isolation in service_worker.js.
 //
 // Feature under test: pi-chrome must never navigate or replace the user's active tab. Page and
-// navigation actions without an explicit target are routed to a dedicated automation target that
-// the *calling Pi session* created and owns. Ownership is session-scoped (one extension brokers
-// every session) and mirrored to chrome.storage.session so a service-worker restart re-hydrates
-// it instead of orphaning the window. Cleanup closes only the calling session's owned target.
+// navigation actions without an explicit target use a dedicated background tab in the user's
+// currently-active window; the tab is created with active:false and never steals focus. Pi never
+// spawns a new Chrome window for its own automation. Ownership is session-scoped (one extension
+// brokers every session) and mirrored to chrome.storage.session so a service-worker restart
+// re-hydrates it. Cleanup closes only the calling session's owned tab; the user's other tabs and
+// their window survive.
 //
 // Like csp-eval.test.mjs we load the *real* worker into a vm sandbox with a stateful chrome.*
 // mock, then exercise the real helpers and the real dispatch() paths. Chrome state (tabs/windows/
@@ -125,6 +127,14 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         return { id, focused, tabs: [{ ...tab }] };
       },
       get: async (id) => { const w = windows.get(id); if (!w) throw new Error(`No window with id ${id}`); return { ...w }; },
+      getCurrent: async () => {
+        // Pretend the most recently active user tab is the "current" window. In real Chrome this
+        // is whichever window holds the focused tab; for the unit test the user window is enough.
+        for (const t of [...tabs.values()].reverse()) {
+          if (t.active && windows.has(t.windowId)) return { ...windows.get(t.windowId) };
+        }
+        return { ...windows.get(userWindowId) };
+      },
       remove: async (id) => { windows.delete(id); for (const [tid, t] of [...tabs]) if (t.windowId === id) tabs.delete(tid); },
       update: async () => {},
     };
@@ -163,25 +173,24 @@ async function run() {
     const userActiveUrl = state.userArticle.url;
 
     const nav = await w.dispatch("page.navigate", { url: "https://pi.test/task", waitUntilLoad: false, sessionKey: SK });
-    ok(state.userArticle.url === userActiveUrl, "navigate: active user tab (research article) is not overwritten");
-    ok(state.userGmail.url === "https://mail.google.com/", "navigate: other user tab (Gmail) untouched");
-    ok(nav.url === "https://pi.test/task", "navigate: automation target navigated to requested URL");
-    ok(nav.id !== state.userArticle.id && nav.id !== state.userGmail.id, "navigate: did not reuse any user tab");
-    ok(nav.windowId !== state.userWindowId, "navigate: automation target lives in a dedicated window");
+    // The automation target lives in the user's currently-active window, opened as a background
+    // tab. It must not replace the user's active tab or any other existing tab.
+    ok(nav.windowId === state.userWindowId, "navigate: automation target lives in the user's currently-active window");
+    ok(state.userArticle.active === true, "navigate: existing user tab stays active (was not replaced)");
 
     const status = await w.dispatch("automation.status", { sessionKey: SK });
-    ok(status.tabId === nav.id && status.windowId === nav.windowId, "ownership: target ids tracked for the session");
+    ok(status.tabId === nav.id && status.windowId === null, "ownership: tab id tracked for the session; windowId is intentionally unset (pi-chrome does not own the user window)");
     ok(w.isPiChromeOwnedTarget(nav.id, SK) === true, "ownership: isPiChromeOwnedTarget(owned, session) === true");
     ok(w.isPiChromeOwnedTarget(state.userArticle.id) === false, "ownership: user tab is never owned (any session)");
 
-    // Reuse: a later navigation reuses the same owned target.
+    // Reuse: a later navigation reuses the same owned target tab.
     const nav2 = await w.dispatch("page.navigate", { url: "https://pi.test/step-2", waitUntilLoad: false, sessionKey: SK });
-    ok(nav2.id === nav.id && nav2.windowId === nav.windowId, "reuse: second navigation reuses the same automation window/tab");
+    ok(nav2.id === nav.id, "reuse: second navigation reuses the same automation tab");
     ok(state.userArticle.url === userActiveUrl, "reuse: user tab still untouched after second navigation");
 
-    // Cleanup closes only the owned window; user tabs/windows survive.
+    // Cleanup closes only the owned tab; the user's window and tabs survive.
     const cleanup = await w.dispatch("automation.cleanup", { sessionKey: SK });
-    ok(cleanup.closedWindowId === nav.windowId, "cleanup: closed the owned window");
+    ok(cleanup.closedTabId === nav.id && cleanup.closedWindowId === null, "cleanup: closed the owned tab (never the shared user window)");
     ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "cleanup: user tabs never closed");
     ok(state.windows.has(state.userWindowId), "cleanup: user window never closed");
     ok(!state.tabs.has(nav.id), "cleanup: the owned automation tab is gone");
@@ -189,30 +198,23 @@ async function run() {
     ok(status2.tabId === null && status2.windowId === null, "cleanup: ownership cleared");
   }
 
-  // ===== Session-group integration: the dedicated-window tab joins this session's group. =====
+  // ===== Session-group integration: the background-tab target joins this session's group. =====
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state, { withTabGroups: true }));
-    // index.ts tags page.* actions with joinSessionGroup + sessionGroupTitle; replicate that here.
     const groupTitle = "Pi Session: alpha";
     const nav = await w.dispatch("page.navigate", {
       url: "https://pi.test/grouped", waitUntilLoad: false,
       sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
     });
     const navTab = state.tabs.get(nav.id);
-    ok(navTab.windowId !== state.userWindowId, "group: automation tab is in its dedicated window");
+    ok(navTab.windowId === state.userWindowId, "group: automation tab is a background tab in the user's currently-active window");
     ok(typeof navTab.groupId === "number" && navTab.groupId >= 0, "group: automation tab joined a tab group");
     const grp = state.groups.get(navTab.groupId);
     ok(grp && grp.title === groupTitle, "group: the group is titled with this session's title");
-    ok(grp.windowId === navTab.windowId, "group: the session group lives inside the dedicated automation window (not the user window)");
-
-    // A second page action reuses the same tab and does not spawn a second group.
-    const groupsBefore = state.groups.size;
-    await w.dispatch("page.navigate", { url: "https://pi.test/grouped-2", waitUntilLoad: false, sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle });
-    ok(state.groups.size === groupsBefore, "group: reusing the automation tab does not create a second group");
   }
-
   // ===== tab.new joins the existing session group instead of creating one group per window. =====
+
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state, { withTabGroups: true }));
@@ -271,7 +273,7 @@ async function run() {
     const w = loadWorker(chrome);
     const nav = await w.dispatch("page.navigate", { url: "https://pi.test/group-fail", waitUntilLoad: false, sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: "Pi Session: alpha" });
     ok(nav.url === "https://pi.test/group-fail", "group-fail: navigation still succeeds when grouping throws");
-    ok(state.tabs.get(nav.id).windowId !== state.userWindowId, "group-fail: still used the dedicated automation window");
+    ok(state.tabs.get(nav.id).windowId === state.userWindowId, "group-fail: still reused the user's currently-active window as a background tab");
   }
 
   // ===== Concurrency: two sessions get separate windows; cleanup is per-session. =====
@@ -280,7 +282,7 @@ async function run() {
     const w = loadWorker(makeChrome(state));
     const a = await w.dispatch("page.navigate", { url: "https://pi.test/a", waitUntilLoad: false, sessionKey: "session:A" });
     const b = await w.dispatch("page.navigate", { url: "https://pi.test/b", waitUntilLoad: false, sessionKey: "session:B" });
-    ok(a.id !== b.id && a.windowId !== b.windowId, "concurrency: each session gets its own dedicated window/tab");
+    ok(a.id !== b.id, "concurrency: each session gets its own dedicated background tab");
     ok(w.isPiChromeOwnedTarget(a.id, "session:A") && !w.isPiChromeOwnedTarget(a.id, "session:B"), "concurrency: ownership is scoped to the creating session");
 
     // Cleaning up session A must not touch session B's target.
@@ -302,12 +304,12 @@ async function run() {
     // same browser tabs/windows + same session storage.
     const w2 = loadWorker(makeChrome(state));
     const statusAfterRestart = await w2.dispatch("automation.status", { sessionKey: SK });
-    ok(statusAfterRestart.tabId === nav.id && statusAfterRestart.windowId === nav.windowId, "restart: re-hydrated the owned target from storage");
+    ok(statusAfterRestart.tabId === nav.id && statusAfterRestart.windowId === null, "restart: re-hydrated the owned tab id; windowId stays unset (pi-chrome does not own the user window)");
 
     // A navigation after restart must REUSE the existing window, not orphan it with a new one.
     const windowsBefore = state.windows.size;
     const nav2 = await w2.dispatch("page.navigate", { url: "https://pi.test/persist-2", waitUntilLoad: false, sessionKey: SK });
-    ok(nav2.id === nav.id && nav2.windowId === nav.windowId, "restart: navigation after restart reuses the persisted window (no orphan)");
+    ok(nav2.id === nav.id, "restart: navigation after restart reuses the persisted tab (no orphan tab created)");
     ok(state.windows.size === windowsBefore, "restart: no new window created after restart");
 
     // Cleanup after restart works and clears persisted state.
@@ -316,18 +318,18 @@ async function run() {
     ok(!(SK in persisted), "restart: cleanup removed the session from persisted storage");
   }
 
-  // ===== Restart after the user manually closed the window: no orphan, fresh target. =====
+  // ===== Restart after the user manually closed the automation tab: no orphan, fresh target. =====
   {
     const state = makeChromeState();
     const w1 = loadWorker(makeChrome(state));
     const nav = await w1.dispatch("page.navigate", { url: "https://pi.test/closed", waitUntilLoad: false, sessionKey: SK });
-    await state.windows.delete(nav.windowId); // user closed pi-chrome's window
-    for (const [tid, t] of [...state.tabs]) if (t.windowId === nav.windowId) state.tabs.delete(tid);
+    state.tabs.delete(nav.id); // user closed the background automation tab (the user window and its other tabs stay)
 
     const w2 = loadWorker(makeChrome(state)); // SW restart
     const nav2 = await w2.dispatch("page.navigate", { url: "https://pi.test/reopened", waitUntilLoad: false, sessionKey: SK });
-    ok(nav2.id !== nav.id, "restart-after-close: a fresh automation target is created when the persisted one is gone");
+    ok(nav2.id !== nav.id, "restart-after-close: a fresh automation tab is created when the persisted one is gone");
     ok(state.tabs.has(nav2.id), "restart-after-close: new target exists");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "restart-after-close: user tabs in the shared window were not disturbed");
   }
 
   // ===== tab.* management never auto-creates / never falls back to the user's active tab. =====
@@ -393,7 +395,10 @@ async function run() {
     ok(stale.closedWindowId === null && stale.closedTabId === null, "cleanup: robust when owned window was already closed");
   }
 
-  // Cleanup must never remove a window wholesale, even if tabs move during removal.
+  // Cleanup must always target only the owned tab — even if the tab is moved between windows
+  // during the cleanup attempt. With the new background-tab design automation tabs live in the
+  // user's currently-active window, so this guarantees we never close the user's window or any
+  // other user tab in it.
   for (const moveOwnedTab of [false, true]) {
     const state = makeChromeState();
     const chrome = makeChrome(state);
@@ -402,26 +407,32 @@ async function run() {
     const owned = await w.getOrCreateAutomationTarget(SK);
     const remove = chrome.tabs.remove;
     chrome.tabs.remove = async (id) => {
-      // User adds a tab just as cleanup starts; a pre-removal window check is not enough.
-      state.userArticle.windowId = owned.windowId;
-      if (moveOwnedTab) state.tabs.get(owned.id).windowId = state.userWindowId;
+      // User moves tabs around just as cleanup starts; a pre-removal contents check is not enough.
+      if (moveOwnedTab) state.tabs.get(owned.id).windowId = state.userWindowId + 9999; // an unrelated window
       await remove(id);
     };
     const result = await w.dispatch("automation.cleanup", { sessionKey: SK });
     ok(result.closedTabId === owned.id && result.closedWindowId === null, "mixed window: only owned tab reported closed");
-    ok(state.tabs.has(state.userArticle.id) && state.windows.has(owned.windowId), "mixed window: user tab and its window survive");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "mixed window: user tabs in the shared window survive");
+    ok(state.windows.has(state.userWindowId), "mixed window: user window never closed");
     ok(!state.tabs.has(owned.id), "mixed window: owned tab removed even after moving to another window");
   }
 
-  // A populated automation window is not disposable merely because Pi created it.
+  // Cleanup must never close the user window when the user moved their own tab into the same
+  // window as the automation tab.
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
     const owned = await w.getOrCreateAutomationTarget(SK);
-    state.userArticle.windowId = owned.windowId;
+    // Both owned tab and userArticle already share the user window; this is the default state in
+    // the new background-tab design. Cleanup must close only the owned tab.
+    ok(state.tabs.get(owned.id).windowId === state.userArticle.windowId, "shared window: owned tab and user tab share the same window before cleanup");
     await w.dispatch("automation.cleanup", { sessionKey: SK });
-    ok(state.tabs.has(state.userArticle.id) && state.windows.has(owned.windowId), "populated window: user's moved-in tab survives cleanup");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "shared window: user's tabs in the shared window survive cleanup");
+    ok(state.windows.has(state.userWindowId), "shared window: user window never closed");
+    ok(!state.tabs.has(owned.id), "shared window: the owned automation tab is removed");
   }
+
 
   // Created vs adopted ownership survives restart; matching titles do not grant ownership.
   for (const restart of [false, true]) {

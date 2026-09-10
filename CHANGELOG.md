@@ -2,6 +2,13 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.52 — 2026-09-10
+
+- **Automation targets no longer start at `about:blank`.** `createAutomationTarget` (used by every implicit page action — navigate, click, type, snapshot, inspect, evaluate, screenshot) now opens a `data:text/html,<!doctype html><title>Pi Chrome</title>` shell. The previous `about:blank` start URL made `chrome.scripting.executeScript` throw `Cannot access contents of url "about:blank"` from `chrome_inspect` / `chrome_snapshot` because manifest `host_permissions` cannot cover the `about:` scheme. The data URL is in-process, has a real document for the debugger to attach to, and stays injectable. Same shell opens for the window-creation and tab-fallback paths.
+- **Clearer protected-URL error.** `getTabByParams` now also rejects `about:` and `edge:` tabs (in addition to `chrome:`, `chrome-extension:`, `devtools:`) and the thrown error tells the operator to navigate the tab to an http(s) URL and retry. Previously `chrome_inspect` on a fresh user tab opened at `about:blank` surfaced the cryptic Chrome-level "Cannot access contents" message instead of a usable next step.
+- **Tests.** All six Node unit suites (`automation-target`, `csp-eval`, `session-cleanup`, `background-policy`, `input-reliability`, `chrome-command`) still pass — 169 assertions green.
+- **Companion version.** `extensions/chrome-profile-bridge/browser-extension/manifest.json` bumped to 0.15.52 by `scripts/sync-manifest-version.js`. Reload the companion at `chrome://extensions` after pulling.
+
 ## 0.15.51 — 2026-09-10
 
 - **Fewer Chrome commands.** Removed `/chrome status`; use bare `/chrome` for the quick connection, authorization, and background dashboard plus controls. The dashboard remains lightweight and does not run page probes.
