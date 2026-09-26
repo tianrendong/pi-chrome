@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 
@@ -235,6 +235,58 @@ function formatCdpResult(method: string, value: unknown): ToolTextResult {
 	}
 	return { content: [{ type: "text", text: truncateText(text) }], details: { value } };
 }
+
+// chrome_screenshot writes a timestamped file per capture (plus -tileN files and a .json manifest for
+// full-page captures) into .pi/chrome-screenshots. Prune that folder at capture time so it stays
+// bounded. Only files matching the tool's own naming are eligible; the newest `keep` captures are always
+// kept, and nothing inside the retention window is removed. Best-effort: errors never fail a capture.
+const SCREENSHOT_NAME_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(?:-tile\d+)?\.(?:png|jpeg)(?:\.json)?$/;
+const SCREENSHOT_KEEP_NEWEST = 20;
+const SCREENSHOT_RETENTION_DAYS = 7;
+
+function screenshotCaptureTime(stamp: string): number {
+	const iso = stamp.replace(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, "$1:$2:$3.$4Z");
+	return Date.parse(iso);
+}
+
+function screenshotFilesToPrune(names: string[], now: number, retentionDays = SCREENSHOT_RETENTION_DAYS, keep = SCREENSHOT_KEEP_NEWEST): string[] {
+	if (!(retentionDays > 0)) return [];
+	const captures = new Map<string, string[]>();
+	for (const name of names) {
+		const match = SCREENSHOT_NAME_RE.exec(name);
+		if (!match) continue;
+		const files = captures.get(match[1]) ?? [];
+		files.push(name);
+		captures.set(match[1], files);
+	}
+	const cutoff = now - retentionDays * 24 * 60 * 60 * 1000;
+	const newestFirst = [...captures.keys()].sort().reverse();
+	const prune: string[] = [];
+	for (const stamp of newestFirst.slice(keep)) {
+		const takenAt = screenshotCaptureTime(stamp);
+		if (Number.isFinite(takenAt) && takenAt < cutoff) prune.push(...(captures.get(stamp) ?? []));
+	}
+	return prune;
+}
+
+async function pruneScreenshotDir(dir: string, retentionDays?: number): Promise<number> {
+	try {
+		const names = await readdir(dir);
+		let removed = 0;
+		for (const name of screenshotFilesToPrune(names, Date.now(), retentionDays)) {
+			try {
+				await unlink(join(dir, name));
+				removed++;
+			} catch {
+				// Locked or already gone: keep going.
+			}
+		}
+		return removed;
+	} catch {
+		return 0;
+	}
+}
+// End screenshot pruning.
 
 function formatChromeInspect(inspect: any): string {
 	if (!inspect || typeof inspect !== "object") return safeJson(inspect);
@@ -1066,7 +1118,8 @@ Capability model (important):
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly. If the action started a navigation, the snapshot waits (up to 5s) for the new page.
-- \`chrome_type\` inserts at the caret and never replaces; check its before/after report. Use \`chrome_fill\` to replace a field.
+- \`chrome_type\` never replaces: with a uid/selector it appends at the end of the field; without one it types at the current caret. Check its before/after report. Use \`chrome_fill\` to replace a field.
+- Chrome ignores real input to hidden pages (inactive tabs, minimized windows, windows behind a macOS full-screen window). Input tools report this instead of silently doing nothing; retry with background:false only when bringing the tab forward is acceptable.
 - \`chrome_cdp\` runs any raw CDP method on a tab (emulation, cookies, PDF, accessibility tree, etc.) when no dedicated chrome_* tool fits; \`chrome_cdp_targets\` diagnoses debugger/overlay conflicts.
 
 Usage rules:
@@ -1630,7 +1683,7 @@ Usage rules:
 			selector: Type.Optional(Type.String({ description: "CSS selector to click. Prefer uid from chrome_snapshot when available." })),
 			x: Type.Optional(Type.Number({ description: "Viewport x coordinate if uid/selector is omitted." })),
 			y: Type.Optional(Type.Number({ description: "Viewport y coordinate if uid/selector is omitted." })),
-			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM-dispatched click if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM-dispatched click if Chrome's CDP input path is blocked (extension overlay, debugger failure, or a hidden tab that ignores trusted input)." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the click." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),
@@ -1654,8 +1707,8 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type at the caret using Chrome's real input. It does NOT replace existing text: in a non-empty field the text is inserted wherever the caret lands after the focus click. Use chrome_fill (or replace=true) to replace a field's value. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. The result reports the field value before/after and insertedAt (empty|caret-end|caret-middle|replaced-selection|replaced-all), with a warning when text was spliced into existing content. Pass includeSnapshot=true to verify after typing; if the action starts a navigation, the snapshot waits (up to 5s) for it to load.",
-		promptSnippet: "Type text at the caret in Chrome (does not replace existing text; use chrome_fill or replace=true).",
+			"Type using Chrome's real input. With a snapshot uid or CSS selector, chrome_type clicks the field and moves the caret to the end, so text is appended to existing content; without one it types at the current caret of the focused element. It does NOT replace existing text. Use chrome_fill (or replace=true) to replace a field's value. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. The result reports the field value before/after and insertedAt (empty|caret-end|caret-middle|replaced-selection|replaced-all), with a warning when text was spliced into existing content. Pass includeSnapshot=true to verify after typing; if the action starts a navigation, the snapshot waits (up to 5s) for it to load.",
+		promptSnippet: "Type text in Chrome; a uid/selector target appends at the end (does not replace existing text; use chrome_fill or replace=true).",
 		parameters: Type.Object({
 			text: Type.String(),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
@@ -1695,7 +1748,7 @@ Usage rules:
 			selector: Type.Optional(Type.String({ description: "CSS selector to fill if uid is omitted." })),
 			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
 			submit: Type.Optional(Type.Boolean({ description: "If true, press Enter after filling." })),
-			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked (extension overlay, debugger failure, or a hidden tab that ignores trusted input)." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after filling." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),
@@ -1845,6 +1898,7 @@ Usage rules:
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ minimum: 0, maximum: 100, description: "JPEG quality 0-100." })),
 			fullPage: Type.Optional(Type.Boolean({ description: "Capture full-page tiles plus a JSON manifest. Temporarily scrolls the target page; does not activate background tabs." })),
+			retentionDays: Type.Optional(Type.Number({ minimum: 0, description: "Default-folder captures older than this many days are pruned (the newest 20 are always kept). Default 7; 0 disables pruning. Explicit paths are never pruned." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -1855,8 +1909,10 @@ Usage rules:
 		async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
 			const format = params.format ?? "png";
 			const cwd = workspaceCwd(ctx);
-			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
+			const screenshotDir = join(cwd, ".pi", "chrome-screenshots");
+			const defaultPath = join(screenshotDir, `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const prune = () => (params.path ? Promise.resolve(0) : pruneScreenshotDir(screenshotDir, params.retentionDays));
 			const result = (await authorizedBridgeSend("page.screenshot", params, params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS, signal)) as {
 				dataUrl?: string;
 				method?: string;
@@ -1880,6 +1936,7 @@ Usage rules:
 					manifest.push({ path: tilePath, y: tile.y });
 				}
 				await writeFile(outputPath + ".json", JSON.stringify({ width, height, viewportHeight, dpr, tiles: manifest }, null, 2));
+				await prune();
 				return {
 					content: [{ type: "text", text: `Saved ${result.tiles.length} full-page tile(s) for ${width}×${height}px page. Manifest: ${outputPath}.json` }],
 					details: { manifest: outputPath + ".json", tiles: manifest, dimensions: result.dimensions, tab: result.tab, method: result.method } as unknown as Record<string, unknown>,
@@ -1888,6 +1945,7 @@ Usage rules:
 			if (!result.dataUrl) throw new Error("Screenshot returned no dataUrl");
 			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
+			await prune();
 			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab, method: result.method } };
 		},
 	});
@@ -1987,12 +2045,13 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_upload_file",
 		label: "Chrome Upload File",
-		description: "Attach local files to an <input type=file> element using Chrome DevTools file-input control. Does NOT open the native file picker; works with React/Vue/Angular controlled inputs.",
+		description: "Attach local files using Chrome DevTools file-input control without opening a native file picker. Target the <input type=file>, a label/wrapper containing one, or an upload button that opens the picker (the chooser is intercepted). Selectors also search same-origin iframes. Works with React/Vue/Angular controlled inputs.",
 		promptSnippet: "Attach local files to a Chrome <input type=file> without opening the native file picker.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String()),
 			selector: Type.Optional(Type.String()),
 			paths: Type.Array(Type.String(), { description: "Local absolute file paths to upload." }),
+			domFallback: Type.Optional(Type.Boolean({ description: "Upload buttons need a click to open the (intercepted) file chooser. If true (default) and the tab is hidden, use a page-level element.click() with a user gesture instead of trusted input. Set false to require trusted input." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -2001,8 +2060,12 @@ Usage rules:
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
 			const cwd = workspaceCwd(ctx);
 			const paths = params.paths.map((p) => resolve(cwd, p));
-			const result = await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal);
-			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+			const result = (await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal)) as { mode?: string; trigger?: string; inFrame?: boolean } | undefined;
+			const via = result?.mode === "file-chooser"
+				? ` via intercepted file chooser (${result.trigger === "activation-click" ? "page-level click because the tab is hidden" : "trusted click"})`
+				: "";
+			const frame = result?.inFrame ? " inside an iframe" : "";
+			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}${frame}${via}` }], details: { result: result as Json } };
 		},
 	});
 

@@ -174,6 +174,17 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   return false;
 }
 
+// A new window created while the user's Chrome window is full screen does not become a visible
+// standalone window: macOS either merges it into the full-screen window as a hidden native window
+// tab ("Prefer tabs: in full screen") or places it on another Space. Its page is hidden, so trusted
+// input cannot reach it. Use a grouped background tab in the user's window instead, which is at least
+// visible in the tab strip and does not add a macOS tab bar to the user's full-screen window.
+async function userWindowIsFullscreen() {
+  if (typeof chrome.windows?.getLastFocused !== "function") return false;
+  const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+  return win?.state === "fullscreen";
+}
+
 // Create a fresh automation target for `sessionKey`. If this session already has a tab group,
 // create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
 // groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
@@ -187,7 +198,7 @@ async function createAutomationTarget(sessionKey, groupTitle) {
     await persistAutomationTargets();
     return tab;
   }
-  if (chrome.windows && typeof chrome.windows.create === "function") {
+  if (chrome.windows && typeof chrome.windows.create === "function" && !(await userWindowIsFullscreen())) {
     try {
       const win = await chrome.windows.create({ url: "about:blank", focused: false });
       const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
@@ -391,7 +402,8 @@ async function attachDebugger(tabId) {
 }
 
 async function describeInputTarget(tabId) {
-  const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+  const id = Number(tabId);
+  const tab = Number.isInteger(id) && id >= 0 ? await chrome.tabs.get(id).catch(() => null) : null;
   const active = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
   let targets = [];
   try { targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))); } catch {}
@@ -408,13 +420,70 @@ function targetMetaSuffix(meta) {
 }
 
 async function inputDebug(params) {
-  const requested = params?.targetId ? await describeInputTarget(Number(params.targetId)) : await describeInputTarget(-1);
+  // No explicit target: describe this session's automation tab if it exists, without creating one.
+  let tabId = params?.targetId !== undefined ? Number(params.targetId) : null;
+  if (tabId === null) {
+    const owned = await resolveOwnedAutomationTarget(sessionKeyOf(params || {})).catch(() => null);
+    tabId = owned?.id ?? null;
+  }
+  const requested = await describeInputTarget(tabId);
   return {
     extensionVersion: chrome.runtime.getManifest().version,
     extensionId: chrome.runtime.id,
     ...requested,
     recentAttachEvents: attachDebugLog.slice(),
   };
+}
+
+// Chrome drops trusted CDP input to hidden pages: mouse presses and keys are silently ignored and
+// mouse moves can hang waiting for a frame. A page is hidden when its tab is inactive, its window is
+// minimized, or (macOS) its window became a native window-tab behind a full-screen window. Check
+// before sending input so the caller gets an actionable error instead of a false success.
+async function pageVisibilityState(tabId) {
+  try {
+    const evaluated = await cdp(tabId, "Runtime.evaluate", { expression: "document.visibilityState", returnByValue: true });
+    const value = evaluated?.result?.value;
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null; // Unknown: do not block input on a failed probe.
+  }
+}
+
+function hiddenTabReason(tab, win) {
+  if (win?.state === "minimized") return "its window is minimized";
+  if (tab && tab.active === false) return "it is an inactive tab in its window";
+  if (win?.state === "fullscreen") return "its window is behind a full-screen window (on macOS, new windows can become hidden window tabs)";
+  return "its window is covered by another window or is on another Space (Chrome treats fully covered windows as hidden)";
+}
+
+async function assertTabVisibleForInput(tab, params, label) {
+  let state = await pageVisibilityState(tab.id);
+  if (state !== "hidden") return;
+  if (foregroundRequested(params)) {
+    // bringToFront just ran; give Chrome a moment to report the page visible.
+    for (let i = 0; i < 6 && state === "hidden"; i++) {
+      await sleep(100);
+      state = await pageVisibilityState(tab.id);
+    }
+    if (state !== "hidden") return;
+  }
+  const fresh = await chrome.tabs.get(tab.id).catch(() => tab);
+  const win = typeof chrome.windows?.get === "function" ? await chrome.windows.get(fresh?.windowId ?? tab.windowId).catch(() => null) : null;
+  const error = new Error(
+    `${label}: tab ${tab.id} is hidden because ${hiddenTabReason(fresh, win)}. Chrome ignores trusted input to hidden pages, so the events would be dropped. ` +
+    `Pass background:false for this call (or run /chrome background off) to bring the tab forward. chrome_click and chrome_fill can instead use their DOM fallback (untrusted page events).`,
+  );
+  error.hiddenTab = true;
+  error.windowState = win?.state;
+  throw error;
+}
+
+// Put the caret at the end of the focused field with Chrome's editing command (platform-neutral,
+// works for inputs, textareas, and contenteditables). Used after chrome_type clicks a field to focus
+// it, so the random click point never splices text into the middle of existing content.
+async function moveCaretToEnd(tabId) {
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "End", code: "End", windowsVirtualKeyCode: 35, commands: ["moveToEndOfDocument"] });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "End", code: "End", windowsVirtualKeyCode: 35 });
 }
 
 async function detachDebugger(tabId) {
@@ -825,6 +894,7 @@ async function chromeInputClick(params) {
   await bringToFront(tab, params);
   try {
     await attachDebugger(tab.id);
+    await assertTabVisibleForInput(tab, params, "chrome.click");
     const resolved = await resolveTargetInTab(tab.id, params);
     const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
     await cdpMoveTo(tab.id, point.x, point.y);
@@ -861,6 +931,7 @@ async function chromeInputHover(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   await attachDebugger(tab.id);
+  await assertTabVisibleForInput(tab, params, "chrome.hover");
   const resolved = await resolveTargetInTab(tab.id, params);
   const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
   await cdpMoveTo(tab.id, point.x, point.y);
@@ -872,6 +943,7 @@ async function chromeInputKey(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   await attachDebugger(tab.id);
+  await assertTabVisibleForInput(tab, params, "chrome.key");
   const key = String(params.key || "");
   if (!key) throw new Error("chrome.key: missing key");
   const mods = params.modifiers || {};
@@ -954,6 +1026,7 @@ async function chromeInputType(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   await attachDebugger(tab.id);
+  await assertTabVisibleForInput(tab, params, "chrome.type");
   if (params.selector || params.uid) {
     // Focus target by clicking it first.
     const resolved = await resolveTargetInTab(tab.id, params);
@@ -963,6 +1036,9 @@ async function chromeInputType(params) {
     await sleep(rng(45, 110));
     await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
     await sleep(rng(50, 120));
+    // The click lands at a random point inside the field, which leaves the caret mid-text. Move it to
+    // the end so a targeted chrome_type appends; replace=true selects everything below anyway.
+    if (params.replace !== true) await moveCaretToEnd(tab.id);
   }
   const text = String(params.text || "");
   // chrome_type inserts at the caret. Read the field before and after so a splice into existing
@@ -1144,6 +1220,7 @@ async function chromeInputFill(params) {
   await bringToFront(tab, params);
   try {
     await attachDebugger(tab.id);
+    await assertTabVisibleForInput(tab, params, "chrome.fill");
     if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
     const resolved = await resolveTargetInTab(tab.id, params);
     const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
@@ -1174,6 +1251,7 @@ async function chromeInputScroll(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   await attachDebugger(tab.id);
+  await assertTabVisibleForInput(tab, params, "chrome.scroll");
   const resolved = (params.selector || params.uid) ? await resolveTargetInTab(tab.id, params) : { x: 100, y: 100, rect: null };
   const x = resolved.rect ? resolved.rect.left + Math.min(resolved.rect.width, 800) / 2 : resolved.x;
   const y = resolved.rect ? resolved.rect.top + Math.min(resolved.rect.height, 600) / 2 : resolved.y;
@@ -1224,6 +1302,7 @@ async function chromeInputTap(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   await attachDebugger(tab.id);
+  await assertTabVisibleForInput(tab, params, "chrome.tap");
   const resolved = (params.selector || params.uid || (typeof params.x === "number" && typeof params.y === "number"))
     ? await resolveTargetInTab(tab.id, params)
     : null;
@@ -1240,6 +1319,7 @@ async function chromeInputDrag(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   await attachDebugger(tab.id);
+  await assertTabVisibleForInput(tab, params, "chrome.drag");
   const from = await resolveTargetInTab(tab.id, { selector: params.fromSelector ?? null, uid: params.fromUid ?? null, x: params.fromX ?? null, y: params.fromY ?? null });
   const to = await resolveTargetInTab(tab.id, { selector: params.toSelector ?? null, uid: params.toUid ?? null, x: params.toX ?? null, y: params.toY ?? null });
   const fp = from.rect ? pickInsideRect(from.rect) : { x: from.x, y: from.y };
@@ -1261,6 +1341,100 @@ async function chromeInputDrag(params) {
   return { input: "chrome", from: fp, to: tp, steps };
 }
 
+// Pending native file-chooser intercepts, keyed by tabId. chrome_upload_file uses these when the
+// target is an upload trigger (button/dropzone) rather than a persistent <input type=file>:
+// Page.setInterceptFileChooserDialog -> click the trigger -> Page.fileChooserOpened ->
+// DOM.setFileInputFiles(backendNodeId). No OS dialog is shown.
+const pendingFileChoosers = new Map();
+const FILE_CHOOSER_TIMEOUT_MS = 8_000;
+
+function fileChooserTabIdForSource(source) {
+  if (typeof source?.tabId === "number") return source.tabId;
+  if (source?.targetId) {
+    for (const [tabId, entry] of attachedTabs) if (entry?.debuggee?.targetId === source.targetId) return tabId;
+  }
+  return undefined;
+}
+
+function handleDebuggerEvent(source, method, params) {
+  if (method !== "Page.fileChooserOpened") return;
+  const tabId = fileChooserTabIdForSource(source);
+  const entry = tabId === undefined ? undefined : pendingFileChoosers.get(tabId);
+  if (!entry) return;
+  pendingFileChoosers.delete(tabId);
+  entry.resolve({ backendNodeId: params?.backendNodeId, mode: params?.mode });
+}
+
+if (chrome.debugger && chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener(handleDebuggerEvent);
+}
+
+function waitForFileChooser(tabId, timeoutMs) {
+  let entry;
+  const promise = new Promise((resolve, reject) => {
+    entry = { resolve, reject };
+    entry.timer = setTimeout(() => {
+      if (pendingFileChoosers.get(tabId) === entry) pendingFileChoosers.delete(tabId);
+      reject(new Error("chrome.upload: no file chooser opened after clicking the target. Pass the <input type=file> itself, or an element that opens the file picker when clicked."));
+    }, timeoutMs);
+  });
+  pendingFileChoosers.set(tabId, entry);
+  return { promise: promise.finally(() => clearTimeout(entry.timer)), cancel: () => { if (pendingFileChoosers.get(tabId) === entry) pendingFileChoosers.delete(tabId); clearTimeout(entry.timer); } };
+}
+
+// Resolve the upload target in the page. Selectors also search same-origin iframes (editors often
+// host their file input in one). A label for a file input, or a wrapper/dropzone containing exactly
+// one file input, resolves to that input so no click is needed.
+function uploadTargetExpression(selector, uid) {
+  return `(() => {
+    const selector = ${JSON.stringify(selector ?? null)};
+    const uid = ${JSON.stringify(uid ?? null)};
+    const state = window.__PI_CHROME_STATE__;
+    const findIn = (doc, depth) => {
+      let found = null;
+      try { found = doc.querySelector(selector); } catch (error) { throw new Error("Invalid selector: " + selector); }
+      if (found || depth >= 3) return found;
+      for (const frame of doc.querySelectorAll("iframe,frame")) {
+        let inner = null;
+        try { inner = frame.contentDocument; } catch {}
+        if (!inner) continue;
+        found = findIn(inner, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+    let el = uid ? state?.elements?.[uid] : (selector ? findIn(document, 0) : null);
+    if (uid && (!el || !el.isConnected)) throw new Error("snapshot uid " + uid + " is stale; refresh chrome_snapshot");
+    if (!el) throw new Error("chrome.upload: target not found: " + (uid || selector));
+    const isFile = (node) => node && node.tagName === "INPUT" && String(node.type).toLowerCase() === "file";
+    if (!isFile(el)) {
+      const control = el.tagName === "LABEL" && isFile(el.control) ? el.control : null;
+      const nested = control ? null : Array.from(el.querySelectorAll ? el.querySelectorAll("input[type=file]") : []);
+      if (control) el = control;
+      else if (nested && nested.length === 1) el = nested[0];
+    }
+    return el;
+  })()`;
+}
+
+const UPLOAD_TARGET_INFO_FN = `function() {
+  const isFile = this.tagName === "INPUT" && String(this.type).toLowerCase() === "file";
+  if (!isFile) this.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+  const r = this.getBoundingClientRect();
+  let x = r.left + r.width / 2, y = r.top + r.height / 2;
+  let win = this.ownerDocument.defaultView;
+  // Convert iframe-relative coordinates to top-level viewport coordinates (same-origin frames only).
+  while (win && win.frameElement) {
+    const frame = win.frameElement;
+    const fr = frame.getBoundingClientRect();
+    const cs = frame.ownerDocument.defaultView.getComputedStyle(frame);
+    x += fr.left + (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0);
+    y += fr.top + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0);
+    win = win.parent === win ? null : win.parent;
+  }
+  return { tag: this.tagName, isFile, multiple: isFile ? this.multiple === true : undefined, inFrame: this.ownerDocument !== document, x, y, width: r.width, height: r.height };
+}`;
+
 async function chromeInputUpload(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
@@ -1268,36 +1442,80 @@ async function chromeInputUpload(params) {
   if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
   if (!paths.length) throw new Error("chrome.upload: no file paths provided");
-  const expression = `(() => {
-    const selector = ${JSON.stringify(params.selector ?? null)};
-    const uid = ${JSON.stringify(params.uid ?? null)};
-    const state = window.__PI_CHROME_STATE__;
-    const el = uid ? state?.elements?.[uid] : (selector ? document.querySelector(selector) : null);
-    if (uid && (!el || !el.isConnected)) throw new Error("snapshot uid " + uid + " is stale; refresh chrome_snapshot");
-    if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
-    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    return el;
-  })()`;
-  const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
-  if (evaluated.exceptionDetails) throw new Error(cdpExceptionText(evaluated.exceptionDetails) || "Could not resolve file input");
+  const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression: uploadTargetExpression(params.selector, params.uid), objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
+  if (evaluated.exceptionDetails) throw new Error(cdpExceptionText(evaluated.exceptionDetails) || "Could not resolve upload target");
   const objectId = evaluated.result?.objectId;
-  if (!objectId) throw new Error("Could not resolve file input object");
+  if (!objectId) throw new Error("Could not resolve upload target object");
   try {
-    await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
-    // Some DOM agents return nodeId:0 (or reject conversion) for a valid remote
-    // element. CDP accepts that same objectId directly, before any file mutation.
-    const requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => null);
-    const target = requested?.nodeId ? { nodeId: requested.nodeId } : { objectId };
-    await cdp(tab.id, "DOM.setFileInputFiles", { ...target, files: paths });
-    await cdp(tab.id, "Runtime.callFunctionOn", {
-      objectId,
-      functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
-      returnByValue: true,
-    }).catch(() => undefined);
+    const infoResult = await cdp(tab.id, "Runtime.callFunctionOn", { objectId, functionDeclaration: UPLOAD_TARGET_INFO_FN, returnByValue: true });
+    const info = infoResult?.result?.value || {};
+    if (info.isFile) {
+      if (paths.length > 1 && info.multiple === false) throw new Error(`chrome.upload: the file input accepts one file but ${paths.length} paths were given`);
+      await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
+      // Some DOM agents return nodeId:0 (or reject conversion) for a valid remote
+      // element. CDP accepts that same objectId directly, before any file mutation.
+      const requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => null);
+      const target = requested?.nodeId ? { nodeId: requested.nodeId } : { objectId };
+      // Chrome's setFileInputFiles normally fires input/change itself. Watch for that and only
+      // dispatch our own events when it did not, so apps never see a duplicate change (double upload).
+      await cdp(tab.id, "Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function() { const el = this; el.__piChromeChangeSeen = false; el.addEventListener("change", () => { el.__piChromeChangeSeen = true; }, { once: true, capture: true }); }`,
+      }).catch(() => undefined);
+      await cdp(tab.id, "DOM.setFileInputFiles", { ...target, files: paths });
+      const notified = await cdp(tab.id, "Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function() { const seen = this.__piChromeChangeSeen === true; delete this.__piChromeChangeSeen; if (seen) return "native"; this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return "dispatched"; }`,
+        returnByValue: true,
+      }).catch(() => null);
+      const events = notified?.result?.value;
+      return { input: "chrome", mode: "file-input", events: typeof events === "string" ? events : undefined, inFrame: info.inFrame || undefined, uploaded: paths.map((path) => ({ path })) };
+    }
+    return await uploadViaFileChooser(tab, params, paths, objectId, info);
   } finally {
     await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
   }
-  return { input: "chrome", uploaded: paths.map((path) => ({ path })) };
+}
+
+// The target opens the native picker when clicked. Intercept the chooser so no OS dialog appears,
+// then attach the files to the input Chrome reports. The click is trusted Chrome input when the page
+// is visible; a hidden page drops trusted input, so there we call element.click() with a CDP user
+// gesture instead (an untrusted event, like chrome_click's DOM fallback) unless domFallback:false.
+async function uploadViaFileChooser(tab, params, paths, objectId, info) {
+  const hidden = (await pageVisibilityState(tab.id)) === "hidden";
+  if (hidden && params.domFallback === false) await assertTabVisibleForInput(tab, params, "chrome.upload");
+  await cdp(tab.id, "Page.enable", {});
+  await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: true });
+  const chooser = waitForFileChooser(tab.id, FILE_CHOOSER_TIMEOUT_MS);
+  let trigger;
+  try {
+    if (!hidden && typeof info.x === "number" && typeof info.y === "number" && info.width > 0 && info.height > 0) {
+      trigger = "chrome";
+      await cdpMoveTo(tab.id, info.x, info.y);
+      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: info.x, y: info.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse" });
+      await sleep(rng(40, 110));
+      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: info.x, y: info.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+    } else {
+      trigger = "activation-click";
+      await cdp(tab.id, "Runtime.callFunctionOn", { objectId, functionDeclaration: "function() { this.click(); }", userGesture: true, awaitPromise: false });
+    }
+    const opened = await chooser.promise;
+    if (typeof opened.backendNodeId !== "number") throw new Error("chrome.upload: file chooser opened without an input node");
+    if (paths.length > 1 && opened.mode === "selectSingle") throw new Error(`chrome.upload: the file chooser accepts one file but ${paths.length} paths were given`);
+    await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
+    await cdp(tab.id, "DOM.setFileInputFiles", { backendNodeId: opened.backendNodeId, files: paths });
+    return {
+      input: "chrome",
+      mode: "file-chooser",
+      trigger,
+      reason: trigger === "activation-click" ? "target tab is hidden; Chrome drops trusted input to hidden pages" : undefined,
+      inFrame: info.inFrame || undefined,
+      uploaded: paths.map((path) => ({ path })),
+    };
+  } finally {
+    chooser.cancel();
+    await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => undefined);
+  }
 }
 // ===============================================================
 

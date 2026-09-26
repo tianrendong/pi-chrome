@@ -17,6 +17,14 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     isContentEditable: editable, isConnected: true, textContent: initial,
     scrollIntoView() {}, getBoundingClientRect: () => ({ left: 10, top: 10, width: 200, height: 60 }),
     contains: (el) => el === element,
+    querySelectorAll: () => [],
+    listeners: [], events: [],
+    addEventListener(type, fn) { this.listeners.push({ type, fn }); },
+    dispatchEvent(event) {
+      this.events.push(event.type);
+      for (const l of this.listeners.splice(0)) if (l.type === event.type) l.fn(event); else this.listeners.push(l);
+      return true;
+    },
   };
   const selection = {
     removeAllRanges() { selectAll = false; },
@@ -33,6 +41,9 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     __PI_CHROME_STATE__: { elements: { "el-1": element } },
   });
   page.window = page;
+  page.document.defaultView = page;
+  page.document.querySelectorAll = () => [];
+  element.ownerDocument = page.document;
   const listener = { addListener() {}, removeListener() {} };
   const chrome = {
     runtime: { id: "test", getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener },
@@ -71,8 +82,15 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
         return { exceptionDetails: { text: error.message, exception: { description: error.message } } };
       }
     }
+    if (method === "Runtime.callFunctionOn" && params.objectId === "upload-object") {
+      const fn = vm.runInContext(`(${params.functionDeclaration})`, page);
+      return { result: { value: clone(fn.call(element) ?? null) } };
+    }
     if (method === "DOM.requestNode") return h.nodeResult;
-    if (method === "DOM.setFileInputFiles") files.push(...params.files);
+    if (method === "DOM.setFileInputFiles") {
+      files.push(...params.files);
+      if (h.nativeChange) { element.dispatchEvent({ type: "input" }); element.dispatchEvent({ type: "change" }); }
+    }
     if (method === "Input.insertText") element.textContent += params.text;
     if (method === "Input.dispatchKeyEvent" && params.type === "keyDown") {
       if (params.key === "Delete") {
@@ -88,6 +106,7 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     element.textContent = params.text;
     return { input: "dom-fallback" };
   };
+  page.Event = class { constructor(type) { this.type = type; } };
   const h = {
     worker, chrome, page, calls, element, selected, files, tabLookups, failures: new Map(), nodeResult: { nodeId },
     call: (action, params = {}) => worker.dispatch(`page.${action}`, { targetId: "2", background: true, ...params }),
@@ -100,6 +119,7 @@ for (const [name, nodeResult] of [["node ID", { nodeId: 7 }], ["zero node ID", {
   test(`upload accepts ${name} and releases the remote object`, async () => {
     const h = harness({ tag: "INPUT", editable: false });
     h.element.type = "file";
+    h.element.multiple = true;
     h.nodeResult = nodeResult;
     const result = await h.call("upload", { uid: "el-1", paths: ["/tmp/a.txt", "/tmp/b.txt"] });
     const target = nodeResult?.nodeId ? { nodeId: 7 } : { objectId: "upload-object" };
@@ -111,6 +131,17 @@ for (const [name, nodeResult] of [["node ID", { nodeId: 7 }], ["zero node ID", {
     assert.equal(h.calls.at(-1).method, "Runtime.releaseObject");
   });
 }
+
+test("upload never duplicates the change event Chrome already fired", async () => {
+  for (const nativeChange of [true, false]) {
+    const h = harness({ tag: "INPUT", editable: false });
+    h.element.type = "file";
+    h.nativeChange = nativeChange;
+    const result = await h.call("upload", { selector: "#target", paths: ["/tmp/a.txt"] });
+    assert.equal(result.events, nativeChange ? "native" : "dispatched");
+    assert.deepEqual(h.element.events.filter((t) => t === "change"), ["change"], `exactly one change (native=${nativeChange})`);
+  }
+});
 
 test("upload falls back on requestNode failure, not on a failed file attachment", async () => {
   const h = harness({ tag: "INPUT", editable: false });
@@ -124,7 +155,7 @@ test("upload falls back on requestNode failure, not on a failed file attachment"
   await assert.rejects(h.call("upload", { selector: "#target", paths: ["/tmp/a.txt"] }), /attachment denied/);
   assert.equal(h.commands("DOM.setFileInputFiles").length, 1, "no object-ID retry after an uncertain file attachment");
   assert.equal(h.commands("Runtime.releaseObject").length, 1, "cleanup still runs on error");
-  assert.equal(h.commands("Runtime.callFunctionOn").length, 0, "no notification after failed attachment");
+  assert.equal(h.commands("Runtime.callFunctionOn").filter((c) => /dispatchEvent/.test(c.params.functionDeclaration)).length, 0, "no notification after failed attachment");
 });
 
 test("upload releases valid node-path references on failure and tolerates notification/cleanup failure", async () => {
@@ -134,14 +165,16 @@ test("upload releases valid node-path references on failure and tolerates notifi
   await assert.rejects(h.call("upload", { selector: "#target", paths: ["/tmp/a.txt"] }), /file inaccessible/);
   assert.equal(h.commands("Runtime.releaseObject").length, 1);
   h.failures.delete("DOM.setFileInputFiles");
-  for (const method of ["DOM.enable", "Runtime.callFunctionOn", "Runtime.releaseObject"]) h.failures.set(method, "optional step failed");
+  for (const method of ["DOM.enable", "Runtime.releaseObject"]) h.failures.set(method, "optional step failed");
   const result = await h.call("upload", { selector: "#target", paths: ["/tmp/a.txt"] });
   assert.equal(result.input, "chrome");
 });
 
-test("upload rejects non-file elements, missing targets/paths, and stale UIDs without attaching anything", async () => {
+test("upload rejects non-trigger elements, missing targets/paths, and stale UIDs without attaching anything", async () => {
   const h = harness();
-  await assert.rejects(h.call("upload", { selector: "#target", paths: ["/tmp/a.txt"] }), /Target must be <input type=file>/);
+  h.worker.waitForFileChooser = () => ({ promise: Promise.reject(new Error("chrome.upload: no file chooser opened after clicking the target.")), cancel() {} });
+  await assert.rejects(h.call("upload", { selector: "#target", paths: ["/tmp/a.txt"] }), /no file chooser opened/);
+  assert.deepEqual(h.commands("Page.setInterceptFileChooserDialog").map((c) => c.params.enabled), [true, false], "intercept is always disabled again");
   await assert.rejects(h.call("upload", { paths: ["/tmp/a.txt"] }), /selector or uid required/);
   await assert.rejects(h.call("upload", { selector: "#target", paths: [] }), /no file paths/);
   h.element.tagName = "INPUT";
@@ -158,7 +191,7 @@ for (const target of [{ selector: "#target" }, { uid: "el-1" }, {}]) {
     const h = harness();
     const result = await h.call("type", { ...target, text: caption });
     assert.deepEqual(h.commands("Input.insertText").map((c) => c.params), [{ text: caption }]);
-    assert.equal(h.commands("Input.dispatchKeyEvent").length, 0);
+    assert.equal(h.commands("Input.dispatchKeyEvent").filter((c) => c.params.key !== "End").length, 0);
     assert.equal(h.element.textContent, caption);
     assert.equal(result.input, "chrome");
     assert.equal(result.length, caption.length);

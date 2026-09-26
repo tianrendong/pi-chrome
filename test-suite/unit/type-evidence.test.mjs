@@ -59,6 +59,7 @@ function harness(element, { platform = "MacIntel", tabs = {} } = {}) {
     calls.push({ method, params: clone(params) });
     if (method === "Input.dispatchKeyEvent") {
       if ((params.commands || []).includes("selectAll")) { element.selectionStart = 0; element.selectionEnd = element.value.length; }
+      else if ((params.commands || []).includes("moveToEndOfDocument") && typeof element.value === "string") { element.selectionStart = element.selectionEnd = element.value.length; }
       else if (params.type === "keyDown" && params.key === "Delete") {
         if (element.selectionEnd > element.selectionStart) splice("");
       } else if (params.type === "keyDown" && params.text && params.key !== "Enter") splice(params.text);
@@ -68,9 +69,29 @@ function harness(element, { platform = "MacIntel", tabs = {} } = {}) {
   return { worker, calls, element, listeners, fire: (tabId, info) => { for (const fn of [...listeners]) fn(tabId, info); } };
 }
 
-test("typing into the middle of a prefilled field reports the splice instead of a bare count", async () => {
+test("a targeted chrome_type moves the caret to the end after its focus click, so it appends", async () => {
   const h = harness(makeInput({ value: "why do flamingos stand", caret: 7 }));
-  const result = await h.worker.dispatch("page.type", { targetId: "2", selector: "#q", text: "cats " });
+  const result = await h.worker.dispatch("page.type", { targetId: "2", selector: "#q", text: " still" });
+  assert.equal(h.element.value, "why do flamingos stand still");
+  assert.equal(result.insertedAt, "caret-end");
+  const moves = h.calls.filter((c) => (c.params.commands || []).includes("moveToEndOfDocument"));
+  assert.equal(moves.length, 1);
+  assert.equal(h.calls.indexOf(moves[0]) > h.calls.findIndex((c) => c.method === "Input.dispatchMouseEvent" && c.params.type === "mouseReleased"), true, "caret moves after the focus click");
+});
+
+test("replace=true does not move the caret first; untargeted typing keeps the user's caret", async () => {
+  const replace = harness(makeInput({ value: "old", caret: 1 }));
+  await replace.worker.dispatch("page.type", { targetId: "2", selector: "#q", text: "new", replace: true });
+  assert.equal(replace.calls.some((c) => (c.params.commands || []).includes("moveToEndOfDocument")), false);
+  const focused = harness(makeInput({ value: "abc", caret: 1 }));
+  await focused.worker.dispatch("page.type", { targetId: "2", text: "X" });
+  assert.equal(focused.calls.some((c) => (c.params.commands || []).includes("moveToEndOfDocument")), false);
+  assert.equal(focused.element.value, "aXbc");
+});
+
+test("typing into the middle of a focused prefilled field reports the splice instead of a bare count", async () => {
+  const h = harness(makeInput({ value: "why do flamingos stand", caret: 7 }));
+  const result = await h.worker.dispatch("page.type", { targetId: "2", text: "cats " });
   assert.equal(h.element.value, "why do cats flamingos stand");
   assert.equal(result.valueBefore, "why do flamingos stand");
   assert.equal(result.valueAfter, "why do cats flamingos stand");
