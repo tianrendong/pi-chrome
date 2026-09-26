@@ -2,6 +2,21 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.53 — 2026-09-26
+
+Changes adapted from community forks (ardhiqii, kkunkunya, nihar-oracle, steimerbyte).
+
+- **Connector recovers from stalled connections.** The extension's `/next` long poll now gives up after 45s (the bridge holds it for up to 25s). Before this, a half-open socket (Pi process died, machine slept, network changed) could leave the extension waiting forever until someone reloaded it by hand. Result posts time out, retry on network/5xx failures, and are never posted twice for the same command.
+- **Page actions work on a fresh automation tab.** Chrome refuses `chrome.scripting` on a top-level `about:blank`, which is where the dedicated automation tab starts. As a result, `chrome_snapshot`, `chrome_inspect`, console/network listing, uid click targeting, and the `/chrome doctor` page probe failed on that tab with `Cannot access contents of url "about:blank"`. When Chrome refuses scripting for a permission reason, these calls now fall back to CDP `Runtime.evaluate`. Ordinary pages still use `chrome.scripting` first.
+- **Chrome tools in subagent sessions.** A second load of the same pi-chrome install in one process (for example, pi-subagents) was skipped as a duplicate, so subagents had no `chrome_*` tools. It now loads as a client of the shared bridge. Subagents share the parent's authorization and get their own automation tab and tab group. Two different install roots are still treated as duplicates. `chrome_launch` in a client session now reports the shared connection state instead of always saying "waiting for extension".
+- **New `chrome_cdp` and `chrome_cdp_targets` tools.** `chrome_cdp` runs one raw Chrome DevTools Protocol method on a tab and validates the method/params first. `timeoutMs` can extend the deadline up to 120s, and screenshot/binary or oversized results are summarized instead of returned in full. Background mode blocks `Page.bringToFront` and `Target.activateTarget`. `chrome_cdp_targets` lists CDP targets on a tab, such as password-manager overlays or DevTools, to help diagnose `Detached while handling command`. It never attaches the debugger or creates a tab.
+- **`chrome_type` shows what it typed.** Results include the field value before and after, and `insertedAt` (`empty`, `caret-end`, `caret-middle`, `replaced-selection`, `replaced-all`). The text warns when input was spliced into existing content, when Enter may have submitted the spliced value, and when the field did not change at all (keystrokes did not reach it). Password/OTP/card-like fields report only lengths. New `replace: true` selects all with Chrome's platform-neutral `selectAll` editing command and deletes before typing. Tool descriptions now state that `chrome_type` inserts at the caret and `chrome_fill` replaces.
+- **`includeSnapshot` waits for navigations.** If a click/type/fill/key action starts a navigation, the included snapshot waits up to 5s for the new page and reports `navigation {from, to, settled, waitedMs}`. Before, it could describe the page being replaced. Actions without navigation do not wait. A page that was already loading is reported but not waited on.
+- **CDP timeouts report as timeouts.** A timed-out CDP command now fails with `CDP <method> timed out after Nms`. Before, the cleanup detach surfaced as `Detached while handling command`, and the command was re-sent once, so a slow command could run twice.
+- **`chrome_tab new` reports the loaded tab.** It waits up to 5s for the URL to load and returns `loadStatus` instead of Chrome's initial empty `loading` tab.
+- **Tool activation.** `chrome_find`, `chrome_inspect`, and the new CDP tools are now activated by `/chrome authorize` and removed from the active tool set by `/chrome revoke` or grant expiry, like the other `chrome_*` tools.
+- **Validation.** New unit suites: `bridge-resilience`, `cdp-passthrough`, `type-evidence`.
+
 ## 0.15.51 — 2026-09-10
 
 - **Fewer Chrome commands.** Removed `/chrome status`; use bare `/chrome` for the quick connection, authorization, and background dashboard plus controls. The dashboard remains lightweight and does not run page probes.

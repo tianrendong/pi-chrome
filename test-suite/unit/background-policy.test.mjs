@@ -24,7 +24,7 @@ function piHarness({ session = "alpha", send } = {}) {
   let authorized = true;
   const ctx = { key: `session:${session}`, title: `Pi Session: ${session}`, cwd: "/fixture", ui: { notify: (...args) => notices.push(args) } };
   const bridge = {
-    connected: true, status: () => ({}),
+    connected: true, status: () => ({}), connectionStatus: async () => ({ connected: true }),
     async send(action, params, timeout, signal) {
       calls.push({ action, params: clone(params), timeout, signal });
       if (signal?.aborted) throw new Error("Chrome command aborted");
@@ -48,6 +48,7 @@ function piHarness({ session = "alpha", send } = {}) {
     tabActionValues: [], snapshotModeValues: [], waitForValues: [], imageFormatValues: [],
     safeJson: JSON.stringify, truncateText: (s) => s, formatChromeSnapshot: JSON.stringify,
     formatChromeInspect: JSON.stringify, summarizeActionResult: () => "", formatIncludedSnapshotText: (_r, text) => text,
+    describeTypeEvidence: () => [], formatCdpResult: (_method, value) => ({ content: [{ type: "text", text: JSON.stringify(value) }], details: { value } }),
     workspaceCwd: () => ctx.cwd, ...path,
     mkdir: async () => {}, writeFile: async (...args) => writes.push(args),
   };
@@ -107,6 +108,7 @@ test("every registered page tool, tab.new, and chrome_launch(url) use the centra
     ["chrome_get_network_request", { requestId: "1" }, "page.network.get"], ["chrome_screenshot", {}, "page.screenshot"],
     ["chrome_hover", {}, "page.hover"], ["chrome_drag", {}, "page.drag"], ["chrome_tap", {}, "page.tap"],
     ["chrome_scroll", {}, "page.scroll"], ["chrome_upload_file", { paths: ["fixture.txt"] }, "page.upload"],
+    ["chrome_cdp", { method: "Runtime.evaluate", params: { expression: "1" } }, "cdp.call"],
   ];
   for (const [name, params, action] of cases) {
     await h.tool(name, { ...params, background: false, foreground: true });

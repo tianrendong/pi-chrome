@@ -173,8 +173,67 @@ function formatChromeSnapshot(snapshot: any): string {
 }
 
 function formatIncludedSnapshotText(raw: unknown, text: string): string {
-	const snapshot = raw && typeof raw === "object" ? (raw as { snapshot?: unknown }).snapshot : undefined;
-	return snapshot ? `${text}\n\n${formatChromeSnapshot(snapshot)}` : text;
+	const payload = raw && typeof raw === "object"
+		? (raw as { snapshot?: unknown; navigation?: { settled?: boolean; from?: string; to?: string; waitedMs?: number } })
+		: undefined;
+	const snapshot = payload?.snapshot;
+	const navigation = payload?.navigation;
+	let body = text;
+	if (navigation) {
+		body += navigation.settled === false
+			? `\n⚠ The action started a navigation that had not finished after ${navigation.waitedMs ?? "?"}ms (${navigation.from || "?"} → ${navigation.to || "?"}). The snapshot below may describe the page being replaced; re-check with chrome_snapshot.`
+			: `\nNavigated ${navigation.from || "?"} → ${navigation.to || "?"} (waited ${navigation.waitedMs ?? "?"}ms for load).`;
+	}
+	return snapshot ? `${body}\n\n${formatChromeSnapshot(snapshot)}` : body;
+}
+
+// Pi-side text for chrome_type's before/after evidence. The worker returns valueBefore/valueAfter
+// (or valueRedacted), existingTextLengthBefore, and insertedAt.
+function describeTypeEvidence(result: unknown, typedLength: number, pressEnter: boolean): string[] {
+	if (!result || typeof result !== "object") return [];
+	const r = result as Record<string, unknown>;
+	const lines: string[] = [];
+	if (r.valueRedacted === true) {
+		lines.push(`Field value [redacted] (${r.existingTextLengthBefore ?? "?"} → ${r.valueLengthAfter ?? "?"} chars; insertedAt=${r.insertedAt ?? "unknown"}).`);
+	} else if (typeof r.valueBefore === "string" || typeof r.valueAfter === "string") {
+		const before = typeof r.valueBefore === "string" ? JSON.stringify(r.valueBefore) : "?";
+		const after = typeof r.valueAfter === "string" ? JSON.stringify(r.valueAfter) : "?";
+		lines.push(`Field went from ${before} to ${after}${r.insertedAt ? ` (insertedAt=${r.insertedAt})` : ""}.`);
+	}
+	const unchanged = typedLength > 0 && r.replaced !== true
+		&& typeof r.existingTextLengthBefore === "number" && r.existingTextLengthBefore === r.valueLengthAfter
+		&& (r.valueRedacted === true || r.valueBefore === r.valueAfter);
+	if (unchanged) {
+		lines.push("\u26a0 The field value did not change: the keystrokes did not reach this field. It may not have keyboard focus (background/hidden tabs often cannot take focus); focus it with a uid/selector click, or ask the user to run /chrome background off, then verify.");
+	} else if (r.insertedAt === "caret-middle" && typedLength > 0) {
+		lines.push("⚠ Text was spliced into the middle of existing content; chrome_type does NOT replace. Use chrome_fill (or chrome_type replace=true) to replace a field's value.");
+		if (pressEnter) lines.push("⚠ If Enter submitted the form, it submitted the spliced value above, not just your text.");
+	} else if (r.insertedAt === "caret-end" && typedLength > 0) {
+		lines.push("Note: text was appended to existing content (chrome_type does not replace).");
+	}
+	return lines;
+}
+
+// Keep raw CDP payloads (screenshots, huge DOM dumps) out of the model context and transcript.
+const CDP_OVERSIZE_JSON_CHARS = 262_144;
+function formatCdpResult(method: string, value: unknown): ToolTextResult {
+	const data = value && typeof value === "object" ? (value as { data?: unknown }).data : undefined;
+	if (typeof data === "string" && (/captureScreenshot|printToPDF|screencast/i.test(method) || data.length >= CDP_OVERSIZE_JSON_CHARS)) {
+		const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+		const bytes = Math.floor((data.length / 4) * 3) - padding;
+		const fields = Object.keys(value as object).filter((key) => key !== "data");
+		const text = `CDP ${method} returned ~${bytes} bytes in its "data" field; the payload was omitted to protect the context window. Use chrome_screenshot to save images to disk.${fields.length ? ` Other fields: ${fields.join(", ")}.` : ""}`;
+		return { content: [{ type: "text", text }], details: { value: { omitted: "data-field", bytes, fields } } };
+	}
+	const text = value === undefined ? "undefined" : typeof value === "string" ? value : (safeJson(value) ?? "undefined");
+	if (text.length > CDP_OVERSIZE_JSON_CHARS) {
+		const fields = value && typeof value === "object" ? Object.keys(value as object) : [];
+		return {
+			content: [{ type: "text", text: `${truncateText(text)}\n\n[details omitted: ${text.length} chars of JSON]` }],
+			details: { value: { omitted: "oversized-result", chars: text.length, fields } },
+		};
+	}
+	return { content: [{ type: "text", text: truncateText(text) }], details: { value } };
 }
 
 function formatChromeInspect(inspect: any): string {
@@ -337,6 +396,31 @@ class ChromeProfileBridge {
 	async start(): Promise<void> {
 		if (this.server || this.mode === "client") return;
 		await this.bindServerOrClient();
+	}
+
+	// A client-mode session (another Pi session or a subagent owns the port) never sees extension
+	// polls itself, so its local status always reads "not connected". Ask the owner instead.
+	async connectionStatus(): Promise<Record<string, unknown>> {
+		const local = this.status();
+		if (this.mode !== "client") return local;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 1_000);
+		try {
+			const response = await fetch(`${this.url}/status`, { signal: controller.signal });
+			if (!response.ok) return local;
+			const owner = (await response.json()) as Record<string, unknown>;
+			return {
+				...local,
+				connected: owner.connected === true,
+				lastSeenAt: typeof owner.lastSeenAt === "number" ? owner.lastSeenAt : local.lastSeenAt,
+				clientName: typeof owner.clientName === "string" ? owner.clientName : local.clientName,
+				ownerMode: owner.mode,
+			};
+		} catch {
+			return local;
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	// Try to own the bridge port. On success we are the server; on EADDRINUSE another Pi
@@ -643,6 +727,8 @@ const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
 	"chrome_snapshot",
+	"chrome_find",
+	"chrome_inspect",
 	"chrome_navigate",
 	"chrome_evaluate",
 	"chrome_click",
@@ -659,6 +745,8 @@ const CHROME_TOOL_NAMES = [
 	"chrome_tap",
 	"chrome_scroll",
 	"chrome_upload_file",
+	"chrome_cdp",
+	"chrome_cdp_targets",
 ] as const;
 const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
 
@@ -674,16 +762,19 @@ export default function (pi: ExtensionAPI): void {
 		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite" };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
-	if (alreadyLoaded?.token || (alreadyLoaded && alreadyLoaded.root !== currentRoot)) {
+	// Only a *different* install root (two copies of pi-chrome) is a duplicate. A same-root re-entry is
+	// legitimate: subagent sessions (e.g. pi-subagents) load extensions into their own runner in this
+	// process, so this factory runs once per session. Skipping it left subagents with no chrome_* tools.
+	// Each instance gets its own bridge; the second binds as a client of the port owner (EADDRINUSE),
+	// so all sessions share the one Chrome connector. Stale flags from older releases (<=0.15.19) that
+	// point at this same root are harmless for the same reason.
+	if (alreadyLoaded && alreadyLoaded.root !== currentRoot) {
 		console.warn(
 			`pi-chrome already loaded from ${alreadyLoaded.root} (v${alreadyLoaded.version}); skipping duplicate from ${currentRoot}.`,
 		);
 		return;
 	}
-	// pi-chrome <=0.15.19 set the singleton flag but did not clear it on reload.
-	// If the stale flag points at this same extension root, replace it instead of
-	// skipping the freshly reloaded extension.
-	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
+	if (!alreadyLoaded) globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundEnabled = true;
@@ -904,11 +995,11 @@ export default function (pi: ExtensionAPI): void {
 		if ((action === "tab.new" || action === "tab.group") && sessionTitle !== undefined) {
 			wireParams = { ...wireParams, groupTitle: sessionTitle };
 		}
-		// Any tab Pi *uses* (page.* interactions) should join this session's group, mirroring the
+		// Any tab Pi *uses* (page.* interactions and raw cdp.call) should join this session's group, mirroring the
 		// auto-grouping that tab.new already does. Tagging the wire params lets getTabByParams pull
-		// the resolved tab into the session group on the service-worker side. We skip tab.* actions:
+		// the resolved tab into the session group on the service-worker side. We skip tab.* and cdp.targets actions:
 		// tab.new/group are forced above, and activate/close/ungroup/list must not group tabs.
-		const shouldJoinGroup = action.startsWith("page.") && sessionTitle !== undefined && params.sessionGroupTitle === undefined;
+		const shouldJoinGroup = (action.startsWith("page.") || action === "cdp.call") && sessionTitle !== undefined && params.sessionGroupTitle === undefined;
 		if (shouldJoinGroup) {
 			wireParams = { ...wireParams, sessionGroupTitle: sessionTitle, joinSessionGroup: true };
 		}
@@ -974,7 +1065,9 @@ Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
-- Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
+- Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly. If the action started a navigation, the snapshot waits (up to 5s) for the new page.
+- \`chrome_type\` inserts at the caret and never replaces; check its before/after report. Use \`chrome_fill\` to replace a field.
+- \`chrome_cdp\` runs any raw CDP method on a tab (emulation, cookies, PDF, accessibility tree, etc.) when no dedicated chrome_* tool fits; \`chrome_cdp_targets\` diagnoses debugger/overlay conflicts.
 
 Usage rules:
 1. If a chrome_* tool says Chrome control is locked, ask the user to run \`/chrome authorize\` before retrying.
@@ -1311,9 +1404,10 @@ Usage rules:
 			headless: Type.Optional(Type.Boolean({ description: "Ignored." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
-			if (params.url && bridge.connected) {
+			const status = await bridge.connectionStatus();
+			if (params.url && status.connected === true) {
 				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
-				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status: bridge.status(), result } };
+				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status, result } };
 			}
 			return {
 				content: [
@@ -1326,10 +1420,10 @@ Usage rules:
 							`2. Enable Developer mode.\n` +
 							`3. Click “Load unpacked”.\n` +
 							`4. Select: ${browserExtensionPath()}\n\n` +
-							`Status: ${bridge.connected ? "connected" : "waiting for extension"}.`,
+							`Status: ${status.connected === true ? "connected" : "waiting for extension"}.`,
 					},
 				],
-				details: { status: bridge.status(), extensionPath: browserExtensionPath() },
+				details: { status, extensionPath: browserExtensionPath() },
 			};
 		},
 	});
@@ -1560,12 +1654,13 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type using Chrome's real input. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. Pass includeSnapshot=true to verify after typing.",
-		promptSnippet: "Type text into Chrome, optionally focusing a snapshot uid or selector first.",
+			"Focus an optional snapshot uid or CSS selector, then type at the caret using Chrome's real input. It does NOT replace existing text: in a non-empty field the text is inserted wherever the caret lands after the focus click. Use chrome_fill (or replace=true) to replace a field's value. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. The result reports the field value before/after and insertedAt (empty|caret-end|caret-middle|replaced-selection|replaced-all), with a warning when text was spliced into existing content. Pass includeSnapshot=true to verify after typing; if the action starts a navigation, the snapshot waits (up to 5s) for it to load.",
+		promptSnippet: "Type text at the caret in Chrome (does not replace existing text; use chrome_fill or replace=true).",
 		parameters: Type.Object({
 			text: Type.String(),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to focus before typing." })),
+			replace: Type.Optional(Type.Boolean({ default: false, description: "If true, select all of the focused field's contents and delete them before typing (real key events). Reports replaced:true." })),
 			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after typing." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
@@ -1582,9 +1677,9 @@ Usage rules:
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
-			const base = `Typed ${params.text.length} character(s)${into}.`;
-			const text = summary ? `${base} (${summary})` : base;
-			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+			const base = `Typed ${params.text.length} character(s)${into}${params.replace ? " (replacing existing contents)" : ""}.`;
+			const lines = [summary ? `${base} (${summary})` : base, ...describeTypeEvidence(result, params.text.length, params.pressEnter === true)];
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, lines.join("\n")) }], details: { result: raw as Json } };
 		},
 	});
 
@@ -1592,7 +1687,7 @@ Usage rules:
 		name: "chrome_fill",
 		label: "Chrome Fill",
 		description:
-			"Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
+			"Replace the whole value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. Unlike chrome_type, existing contents are cleared first. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
 		promptSnippet: "Fill a Chrome form field by snapshot uid or selector, optionally returning a fresh snapshot.",
 		parameters: Type.Object({
 			text: Type.String(),
@@ -1908,6 +2003,64 @@ Usage rules:
 			const paths = params.paths.map((p) => resolve(cwd, p));
 			const result = await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cdp",
+		label: "Chrome CDP Call",
+		description:
+			"Low-level escape hatch: run one Chrome DevTools Protocol (CDP) method against a tab (no target = this session's automation tab), e.g. Emulation.setDeviceMetricsOverride, Network.getCookies, DOM.getDocument, Page.printToPDF, Accessibility.getFullAXTree. Put CDP fields inside params. Nothing is filtered against a safe list: destructive methods run as given. Prefer dedicated chrome_* tools when they cover the task. Background mode blocks Page.bringToFront and Target.activateTarget, but other methods can still change what the user sees. Screenshot/binary payloads and results over 256 KiB are summarised instead of returned in full. Domain events are not streamed back; only the method's direct result is returned.",
+		promptSnippet: "Run a raw Chrome DevTools Protocol method against a Chrome tab (low-level escape hatch).",
+		parameters: Type.Object({
+			method: Type.String({ description: "CDP method name, e.g. \"Runtime.evaluate\" or \"Emulation.setDeviceMetricsOverride\"." }),
+			params: Type.Optional(Type.Object({}, { additionalProperties: true, description: "CDP parameter object for the method." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Deadline for the CDP command in milliseconds. Default 5000, max 120000. On timeout the debugger session is detached and the next call re-attaches." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			// Raw CDP fields passed at the top level would reach Chrome as params:{} and fail with an
+			// opaque "Invalid parameters". Point the caller at params instead.
+			const knownKeys = new Set(["method", "params", "timeoutMs", "targetId", "urlIncludes", "titleIncludes", "background", "foreground", "host", "port"]);
+			const unknownKeys = Object.keys(params).filter((key) => !knownKeys.has(key));
+			if (unknownKeys.length > 0) {
+				throw new Error(`chrome_cdp received unknown top-level parameter(s): ${unknownKeys.join(", ")}. Put CDP fields inside "params", e.g. { method: "Runtime.evaluate", params: { expression: "1+1" } }.`);
+			}
+			// Keep the bridge deadline above the worker's (CDP deadline + 5s grace) so the precise
+			// "CDP <method> timed out" error wins.
+			const requested = Number(params.timeoutMs);
+			const bridgeTimeoutMs = Number.isFinite(requested) && requested > 0
+				? Math.max(DEFAULT_TIMEOUT_MS, Math.min(Math.floor(requested), 120_000) + 10_000)
+				: DEFAULT_TIMEOUT_MS;
+			const value = await authorizedBridgeSend("cdp.call", params, bridgeTimeoutMs, signal);
+			return formatCdpResult(params.method, value);
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cdp_targets",
+		label: "Chrome CDP Targets",
+		description:
+			"List Chrome DevTools Protocol targets attached to a tab (type, url, attached, extensionId). Use it to diagnose chrome_* / chrome_cdp failures such as \"Detached while handling command\": password-manager/autofill overlays and DevTools front-ends show up here. Targets on other tabs are only counted. Does not attach the debugger or create an automation tab; with no target it reports this session's automation tab if one exists.",
+		promptSnippet: "List CDP targets (including foreign extension overlays) attached to a Chrome tab.",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const value = await authorizedBridgeSend("cdp.targets", params, DEFAULT_TIMEOUT_MS, signal);
+			const result = value as { tab?: { id?: number; title?: string; url?: string } | null; targets?: Array<{ type?: string; attached?: boolean; url?: string; extensionId?: string }>; otherTabTargetCount?: number } | undefined;
+			const targets = result?.targets ?? [];
+			const text = [
+				result?.tab ? `Tab ${result.tab.id}: ${result.tab.title || "(untitled)"} \u2014 ${result.tab.url ?? ""}` : "No resolved tab (pass targetId/urlIncludes/titleIncludes, or run chrome_navigate first).",
+				`${targets.length} CDP target(s) on this tab${result?.otherTabTargetCount ? ` (${result.otherTabTargetCount} on other tabs, not listed)` : ""}:`,
+				...targets.map((t) => `- ${t.type ?? "?"}\t${t.attached ? "attached" : "detached"}\t${t.extensionId ? `ext=${t.extensionId}\t` : ""}${t.url ?? ""}`),
+			].join("\n");
+			return { content: [{ type: "text", text: truncateText(text) }], details: { value: (value ?? null) as Json } };
 		},
 	});
 	}
