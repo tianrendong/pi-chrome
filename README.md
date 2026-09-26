@@ -85,7 +85,7 @@ Run `/chrome revoke` when finished. Use `/chrome authorize` again whenever you w
 
 This is browser automation, not full OS control. Native Chrome/OS dialogs, password-manager prompts, passkeys/security keys/biometrics, CAPTCHA challenges, cross-origin iframe DOM access, rich multitouch/stylus gestures, and arbitrary desktop apps are outside its reliable tool surface. Some workflows need human assistance.
 
-If page inspection or evaluation is blocked, use screenshots and coordinate input where possible. Background pages can throttle rendering or reject focus-gated actions. See the [FAQ](./docs/FAQ.md) for details.
+If page inspection or evaluation is blocked, use screenshots and coordinate input where possible. Background pages can throttle rendering or reject focus-gated actions. Chrome ignores real input to hidden pages (inactive tabs, covered or minimized windows, windows behind a macOS full-screen window); input tools report this instead of pretending to succeed. See the [FAQ](./docs/FAQ.md) for details.
 
 ## Commands
 

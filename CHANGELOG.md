@@ -2,6 +2,17 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.54 — 2026-09-26
+
+- **Hidden tabs report instead of silently dropping input.** Chrome ignores trusted input to hidden pages. A page is hidden when it is an inactive tab, its window is minimized, its window is fully covered by another window, or (on macOS) its window became a hidden window tab behind a full-screen window. In a hidden page, mouse presses and keys were dropped while the tool reported success, and mouse moves could hang until a timeout (the source of `Detached while handling command` in background runs). Input tools now check page visibility first. `chrome_type`, `chrome_key`, `chrome_hover`, `chrome_scroll`, `chrome_tap` and `chrome_drag` fail fast with the reason and the options (`background:false`, or `/chrome background off`). `chrome_click` and `chrome_fill` go straight to their existing DOM fallback and report the reason, or reject with `domFallback:false`. Hard background mode is unchanged: nothing is activated or focused.
+- **No hidden automation windows in full screen.** While your Chrome window is full screen, a new automation window would become a hidden macOS window tab or land on another Space. The automation target is now an inactive tab in your window instead.
+- **Targeted `chrome_type` appends.** With a uid/selector, `chrome_type` clicked a random point inside the field, which left the caret mid-text and spliced input into existing content. After the focus click it now moves the caret to the end with Chrome's `moveToEndOfDocument` editing command. Untargeted typing still uses the current caret; `replace:true` is unchanged.
+- **Upload buttons, labels, wrappers, and iframes.** `chrome_upload_file` accepts a label for a file input, or a wrapper/dropzone containing exactly one, and searches same-origin iframes for selectors. For upload buttons that open the native picker (no persistent `<input type=file>`), it intercepts the file chooser (`Page.setInterceptFileChooserDialog`) so no OS dialog appears. The trigger click uses trusted Chrome input on visible pages. On hidden pages it uses `element.click()` with a CDP user gesture, unless `domFallback:false`. It rejects multiple paths for single-file inputs. Adapted from kkunkunya's fork.
+- **No duplicate `change` on upload.** Chrome's `DOM.setFileInputFiles` already fires `input`/`change`, and pi-chrome dispatched a second pair, which could make apps upload twice. It now dispatches only when Chrome did not, and reports `events: native|dispatched`.
+- **Bounded screenshot folder.** Default-path `chrome_screenshot` captures prune `.pi/chrome-screenshots` at capture time. Captures older than 7 days are removed, but the newest 20 are always kept. Only files matching the tool's own naming (including full-page tiles and manifests) are eligible, and explicit `path:` captures are never pruned. `retentionDays` overrides the window; `0` disables pruning. Adapted from ardhiqii's fork.
+- **`input.debug` without a target.** It no longer fails with `Value must be at least 0`; it describes this session's automation tab if one exists.
+- **Validation.** New `hidden-input` unit suite. Live-checked on Chrome/macOS: hidden-tab errors and DOM fallbacks, caret-end typing in inputs and contenteditables, all upload shapes in visible and hidden tabs, single `change` events, and pruning through a real Pi session.
+
 ## 0.15.53 — 2026-09-26
 
 Changes adapted from community forks (ardhiqii, kkunkunya, nihar-oracle, steimerbyte).

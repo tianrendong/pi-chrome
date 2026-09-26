@@ -75,7 +75,7 @@ If the page did not change, take a fresh snapshot or screenshot and check for ov
 
 ## How do I attach a file to a React file input?
 
-`chrome_upload_file` — uses Chrome DevTools file-input control and fires `input` + `change` events. It does **not** open the native file picker. Works with React/Vue/Angular controlled inputs.
+`chrome_upload_file` — uses Chrome DevTools file-input control; the page gets one `input` + `change`. Target the file input, a label or wrapper containing one, or an upload button: for buttons, the native file chooser is intercepted, so no OS dialog appears. Selectors also search same-origin iframes. Works with React/Vue/Angular controlled inputs.
 
 ## Can it record videos?
 

@@ -50,7 +50,7 @@ function piHarness({ session = "alpha", send } = {}) {
     formatChromeInspect: JSON.stringify, summarizeActionResult: () => "", formatIncludedSnapshotText: (_r, text) => text,
     describeTypeEvidence: () => [], formatCdpResult: (_method, value) => ({ content: [{ type: "text", text: JSON.stringify(value) }], details: { value } }),
     workspaceCwd: () => ctx.cwd, ...path,
-    mkdir: async () => {}, writeFile: async (...args) => writes.push(args),
+    mkdir: async () => {}, writeFile: async (...args) => writes.push(args), pruneScreenshotDir: async () => 0,
   };
   const registrations = indexSource.slice(indexSource.indexOf("function registerChromeTools(pi:"), indexSource.lastIndexOf("\n}"));
   vm.runInNewContext(stripTypeScriptTypes([
@@ -292,6 +292,7 @@ function workerHarness({ withWindows = true } = {}) {
     w, chrome, calls, tabs, focusedWindow: () => focusedWindow,
     cdpResult: (method) => method === "Page.captureScreenshot" ? { data: "c2NyZWVuc2hvdA==" }
       : method === "DOM.requestNode" ? { nodeId: 1 }
+      : method === "Runtime.callFunctionOn" ? { result: { type: "object", value: { tag: "INPUT", isFile: true } } }
       : { result: { type: "boolean", value: true, objectId: "file-input" } },
   };
   return h;
