@@ -27,6 +27,7 @@ The Chrome extension under `extensions/chrome-profile-bridge/browser-extension/`
 - Loopback bridge only. No remote port. No telemetry.
 - Chrome real input layer for interactive controls.
 - Chrome control locked by default; `/chrome authorize` unlocks current Pi session after terminal confirmation, `/chrome revoke` locks it again.
+- `chrome_cdp` sends raw Chrome DevTools Protocol commands to a tab. It is locked behind `/chrome authorize` like every other tool, but it is not filtered against a safe list. Background mode blocks only its explicit focus methods (`Page.bringToFront`, `Target.activateTarget`).
 - Hard background mode is on by default: tools cannot override it to explicitly focus windows or activate tabs. `/chrome background off` allows foreground/watch mode. This is not a security sandbox: trusted input, page scripts, native prompts, and Chrome/OS behavior can still affect focus.
 
 ## Custom ports

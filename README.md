@@ -16,7 +16,7 @@ Try prompts like these after setup:
 | **Understand an existing page** | “Find my open dashboard tab and summarize what's on the page. Don't change anything.” |
 | **Create evidence for a PR** | “On my local app, capture the empty, loading, and populated states of this feature for my PR.” |
 
-Pi gets tools to inspect pages, click, type, fill forms, scroll, upload files, capture screenshots, and inspect captured console logs and `fetch`/`XMLHttpRequest` responses. You describe the task; Pi handles the agent loop.
+Pi gets tools to inspect pages, click, type, fill forms, scroll, upload files, capture screenshots, and inspect captured console logs and `fetch`/`XMLHttpRequest` responses. A raw Chrome DevTools Protocol tool (`chrome_cdp`) covers anything else, such as device emulation, cookies, PDFs, or the accessibility tree. You describe the task; Pi handles the agent loop.
 
 **Best fit:** interactive workflows in the Chrome profile you already use. For deterministic CI tests, consider a test framework such as Playwright; for fleets of isolated browsers, consider a hosted browser service. See [more workflows](./docs/EXAMPLES.md) and [browser-tool comparisons](./docs/COMPARISON.md).
 

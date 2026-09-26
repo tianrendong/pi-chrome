@@ -1,6 +1,13 @@
 const BRIDGE_URL = "http://127.0.0.1:17318";
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
+// /next is a server-side long poll held for up to 25s (see waitForCommand in index.ts). A fetch that
+// outlives this deadline means the socket is half-open (the owning Pi process died, the machine
+// slept, the network changed) and will never settle; abort it so pollLoop backs off and reconnects
+// instead of parking on a zombie connection until the extension is reloaded by hand.
+const POLL_REQUEST_TIMEOUT_MS = 45_000;
+const RESULT_REQUEST_TIMEOUT_MS = 15_000;
+const RESULT_POST_ATTEMPTS = 3;
 const DEFAULT_GROUP_COLOR = "blue";
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
@@ -8,6 +15,8 @@ const COMMAND_TIMEOUT_MS = 25_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
 const SCRIPTING_TIMEOUT_MS = 8_000;
 const ATTACH_TIMEOUT_MS = 3_000;
+// Raw CDP methods that explicitly focus or activate a tab. Blocked by hard background mode.
+const CDP_FOCUS_METHODS = new Set(["Page.bringToFront", "Target.activateTarget"]);
 let polling = false;
 
 // =================== pi-chrome automation target ownership ===================
@@ -250,9 +259,12 @@ function withTimeout(promise, ms, label, onTimeout) {
   return Promise.race([
     Promise.resolve(promise).finally(() => clearTimeout(timer)),
     new Promise((_, reject) => {
-      timer = setTimeout(async () => {
-        try { await onTimeout?.(); } catch {}
+      timer = setTimeout(() => {
+        // Settle with the timeout first. Cleanup (e.g. debugger detach) makes the pending command
+        // fail with "Detached while handling command"; if that won the race, cdp() would treat it as
+        // a stale session and re-send a command that may already have run.
         reject(new Error(`${label} timed out after ${ms}ms`));
+        Promise.resolve().then(() => onTimeout?.()).catch(() => {});
       }, ms);
     }),
   ]);
@@ -435,14 +447,28 @@ setInterval(() => {
   }
 }, 5000);
 
-function cdpRaw(tabId, method, params) {
+// Deadline policy for cdp.call. Callers may widen the per-command CDP deadline via params.timeoutMs,
+// clamped below the MV3 service-worker lifetime so a stuck command cannot pin the debugger forever.
+const CDP_CALL_MAX_TIMEOUT_MS = 120_000;
+const CDP_CALL_GRACE_MS = 5_000;
+function cdpCallTimeoutMs(params) {
+  const requested = Number(params?.timeoutMs);
+  if (!Number.isFinite(requested) || requested <= 0) return CDP_COMMAND_TIMEOUT_MS;
+  return Math.min(Math.floor(requested), CDP_CALL_MAX_TIMEOUT_MS);
+}
+
+// `opts.timeoutMs` overrides the default per-command deadline. On timeout the session is detached
+// and forgotten so the next call re-attaches cleanly.
+function cdpRaw(tabId, method, params, opts) {
   const debuggee = attachedTabs.get(tabId)?.debuggee || { tabId };
+  const requested = Number(opts?.timeoutMs);
+  const timeoutMs = Number.isFinite(requested) && requested > 0 ? requested : CDP_COMMAND_TIMEOUT_MS;
   return withTimeout(new Promise((resolve, reject) => {
     chrome.debugger.sendCommand(debuggee, method, params || {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(`${method}: ${chrome.runtime.lastError.message}`));
       else resolve(result);
     });
-  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`, async () => {
+  }), timeoutMs, `CDP ${method}`, async () => {
     attachedTabs.delete(tabId);
     try { await chrome.debugger.detach(debuggee); } catch {}
   });
@@ -450,6 +476,51 @@ function cdpRaw(tabId, method, params) {
 
 function executeScriptTimed(options, label) {
   return withTimeout(chrome.scripting.executeScript(options), SCRIPTING_TIMEOUT_MS, label || "chrome.scripting.executeScript");
+}
+
+// Chrome refuses chrome.scripting on pages outside the extension's host permissions. Notably a
+// top-level about:blank (pi-chrome's fresh automation tab) has an opaque origin that <all_urls>
+// does not cover, so snapshot/inspect/probe/console/click-resolution failed there with
+// "Cannot access contents of url \"about:blank\"". The debugger API still attaches to about:blank.
+function isScriptingAccessDenied(error) {
+  const message = String(error?.message || error);
+  return /Cannot access contents of url|Cannot access .+ at origin|Extension manifest must request permission|matchAboutBlank must be true/i.test(message);
+}
+
+// chrome.scripting.executeScript with a CDP Runtime.evaluate fallback when Chrome refuses scripting
+// for a permission reason. Scripting stays primary: it is what ordinary pages use and the only path
+// that works while DevTools holds the tab's debugger. The fallback runs in the same MAIN world and
+// covers both forms: `func` is stringified and invoked with its args; `files` are read from the
+// extension package and evaluated. Any other scripting failure surfaces unchanged.
+const packagedFileSources = new Map();
+async function executeScriptWithFallback(options, label) {
+  try {
+    return await executeScriptTimed(options, label);
+  } catch (error) {
+    if (!isScriptingAccessDenied(error) || !chrome.debugger) throw error;
+    const tabId = options?.target?.tabId;
+    recordAttachEvent({ kind: "scripting-denied-cdp-fallback", tabId, files: options?.files || null, message: String(error?.message || error).slice(0, 300) });
+    if (Array.isArray(options?.files) && options.files.length) {
+      for (const file of options.files) {
+        if (!packagedFileSources.has(file)) {
+          const response = await fetch(chrome.runtime.getURL(file));
+          if (!response.ok) throw new Error(`Could not read ${file} for CDP injection (HTTP ${response.status})`);
+          packagedFileSources.set(file, await response.text());
+        }
+        const injected = await cdpEval(tabId, packagedFileSources.get(file));
+        if (injected.exceptionDetails) {
+          throw new Error(`${label || file}: ${cdpExceptionText(injected.exceptionDetails) || "CDP injection failed"}`);
+        }
+      }
+      return [{ result: undefined }];
+    }
+    const expression = `(${options.func.toString()})(...${JSON.stringify(Array.isArray(options.args) ? options.args : [])})`;
+    const result = await cdpEval(tabId, expression);
+    if (result.exceptionDetails) {
+      throw new Error(`${label || "page script"}: ${cdpExceptionText(result.exceptionDetails) || "evaluation failed"}`);
+    }
+    return [{ result: result.result?.value }];
+  }
 }
 
 // Wraps cdpRaw with one auto-recover on detached/closed sessions:
@@ -494,9 +565,9 @@ async function dismissOverlayViaEscape(tabId) {
   } catch {}
 }
 
-async function cdp(tabId, method, params) {
+async function cdp(tabId, method, params, opts) {
   try {
-    return await cdpRaw(tabId, method, params);
+    return await cdpRaw(tabId, method, params, opts);
   } catch (error) {
     const msg = String(error?.message || error);
     const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id/i.test(msg);
@@ -508,7 +579,7 @@ async function cdp(tabId, method, params) {
       recordAttachEvent({ kind: "foreign-ext-detected", tabId, method, foreignExtId: extractForeignExtId(before), targetCount: before.length });
       await dismissOverlayViaEscape(tabId);
       try {
-        return await cdpRaw(tabId, method, params);
+        return await cdpRaw(tabId, method, params, opts);
       } catch (retryErr) {
         const retryMsg = String(retryErr?.message || retryErr);
         if (/Cannot access a chrome-extension:\/\/ URL of different extension/i.test(retryMsg)) {
@@ -525,7 +596,7 @@ async function cdp(tabId, method, params) {
     if (!isStale) throw error;
     attachedTabs.delete(tabId);
     await attachDebugger(tabId).catch(() => undefined);
-    return cdpRaw(tabId, method, params);
+    return cdpRaw(tabId, method, params, opts);
   }
 }
 
@@ -563,7 +634,7 @@ function cdpIsSyntaxError(details) {
 
 // Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
 async function resolveTargetInTab(tabId, params) {
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
@@ -721,7 +792,7 @@ async function cdpTypeChar(tabId, ch) {
 }
 
 async function domClickFallback(tabId, params, cause) {
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
@@ -764,7 +835,7 @@ async function chromeInputClick(params) {
     // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
     // Reset focus styling after pointer click when possible.
     if (params.selector || params.uid) {
-      await executeScriptTimed({
+      await executeScriptWithFallback({
         target: { tabId: tab.id, frameIds: [0] },
         world: "MAIN",
         func: (sel, uid) => {
@@ -840,7 +911,7 @@ async function chromeInputKey(params) {
 // the requested editor's entire contents: triple-click only selects a paragraph.
 // Selection uses the DOM; deletion and insertion still use Chrome's input layer.
 async function contentEditableInTab(tabId, selectAllParams = null) {
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, selectAll) => {
@@ -894,14 +965,143 @@ async function chromeInputType(params) {
     await sleep(rng(50, 120));
   }
   const text = String(params.text || "");
+  // chrome_type inserts at the caret. Read the field before and after so a splice into existing
+  // text is reported instead of hidden behind a bare character count. The "before" read precedes
+  // replace's select-all/delete. Reads are best-effort and never block typing.
+  const before = await readInputStateInTab(tab.id, params).catch(() => null);
+  if (params.replace === true) await selectAllAndDelete(tab.id);
   const typing = await typeTextInTab(tab.id, text, params.perCharacter);
+  const after = await readInputStateInTab(tab.id, params).catch(() => null);
   if (params.pressEnter) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
-  return { input: "chrome", length: text.length, typing };
+  return {
+    input: "chrome",
+    length: text.length,
+    typing,
+    ...inputValueEvidence(before, after, { replaced: params.replace === true }),
+  };
+}
+
+// Select the focused field's whole contents with Chrome's editing command, then delete it with real
+// key events. The selectAll editing command is platform-neutral (Ctrl+A moves to line start on macOS).
+async function selectAllAndDelete(tabId) {
+  const mac = /Mac/i.test(String(globalThis.navigator?.platform || globalThis.navigator?.userAgent || ""));
+  const modifiers = mac ? 4 : 2;
+  const key = mac ? { key: "Meta", code: "MetaLeft", vk: 91 } : { key: "Control", code: "ControlLeft", vk: 17 };
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: key.key, code: key.code, windowsVirtualKeyCode: key.vk, modifiers });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers, commands: ["selectAll"] });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: key.key, code: key.code, windowsVirtualKeyCode: key.vk, modifiers: 0 });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+  await sleep(rng(20, 60));
+}
+
+// Read the typing target's value and caret. Sensitive fields (password/OTP/card/etc., matching the
+// snapshot redaction convention) report only valueRedacted + length, never contents. Displayed values
+// are truncated to 120 chars like snapshots; lengths and caret offsets are exact.
+async function readInputStateInTab(tabId, params) {
+  const results = await executeScriptWithFallback({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid) => {
+      const state = window.__PI_CHROME_STATE__;
+      const carrierOf = (node) => {
+        if (!node) return null;
+        if ("value" in node && typeof node.value === "string" && /^(INPUT|TEXTAREA)$/.test(node.tagName)) return "value";
+        if (node.isContentEditable === true) return "contenteditable";
+        return null;
+      };
+      let el = uid ? (state && state.elements ? state.elements[uid] : null) : null;
+      if (uid && (!el || !el.isConnected)) el = null;
+      if (!el && selector) el = document.querySelector(selector);
+      const active = document.activeElement;
+      // The uid/selector can name a wrapper (role=textbox, label) rather than the element that
+      // receives text. Prefer the focused carrier in that case so we do not report a false "" -> "".
+      if (!carrierOf(el) && carrierOf(active)) el = active;
+      const carrier = carrierOf(el);
+      if (!carrier) return { found: false };
+      const raw = carrier === "value" ? el.value : String(el.textContent || "");
+      const attr = (name) => (el.getAttribute ? el.getAttribute(name) : null);
+      const type = String(el.type || attr("type") || "").toLowerCase();
+      const haystack = [type, el.name, attr("name"), el.id, attr("autocomplete"), attr("aria-label"), attr("placeholder"), attr("data-testid")].filter(Boolean).join(" ").toLowerCase();
+      const sensitive = type === "password" || /password|passwd|\bpwd\b|secret|token|bearer|api[-_ ]?key|access[-_ ]?key|auth[-_ ]?code|one[-_ ]?time|otp|2fa|mfa|verification[-_ ]?code|recovery[-_ ]?code|credit[-_ ]?card|card[-_ ]?number|cc-number|cc-csc|cvc|cvv|security[-_ ]?code|ssn|social[-_ ]?security/.test(haystack);
+      let selectionStart = null;
+      let selectionEnd = null;
+      try {
+        if (typeof el.selectionStart === "number") selectionStart = el.selectionStart;
+        if (typeof el.selectionEnd === "number") selectionEnd = el.selectionEnd;
+      } catch {}
+      let caretOffset = null;
+      if (carrier === "contenteditable") {
+        try {
+          const selection = window.getSelection && window.getSelection();
+          if (selection && selection.rangeCount > 0 && selection.anchorNode && el.contains(selection.anchorNode)) {
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            range.setEnd(selection.anchorNode, selection.anchorOffset);
+            caretOffset = range.toString().length;
+            if (!selection.isCollapsed) selectionEnd = caretOffset + String(selection.toString()).length;
+          }
+        } catch {}
+      }
+      return {
+        found: true,
+        carrier,
+        value: sensitive ? undefined : raw.slice(0, 120),
+        valueLength: raw.length,
+        valueRedacted: sensitive ? true : undefined,
+        selectionStart,
+        selectionEnd,
+        caretOffset,
+      };
+    },
+    args: [params.selector ?? null, params.uid ?? null],
+  }, `read input value in tab ${tabId}`);
+  const v = results?.[0]?.result;
+  return v && typeof v === "object" ? v : { found: false };
+}
+
+// Where typed text landed relative to the field's existing contents.
+function inputInsertPosition(before) {
+  const length = before.valueLength ?? 0;
+  if (length === 0) return "empty";
+  if (typeof before.selectionStart === "number" && typeof before.selectionEnd === "number") {
+    if (before.selectionEnd > before.selectionStart) {
+      return before.selectionStart === 0 && before.selectionEnd >= length ? "replaced-all" : "replaced-selection";
+    }
+    return before.selectionStart < length ? "caret-middle" : "caret-end";
+  }
+  if (typeof before.caretOffset === "number") {
+    if (typeof before.selectionEnd === "number" && before.selectionEnd > before.caretOffset) {
+      return before.caretOffset === 0 && before.selectionEnd >= length ? "replaced-all" : "replaced-selection";
+    }
+    return before.caretOffset < length ? "caret-middle" : "caret-end";
+  }
+  return undefined;
+}
+
+function inputValueEvidence(before, after, { replaced = false } = {}) {
+  const hasBefore = Boolean(before?.found);
+  const hasAfter = Boolean(after?.found);
+  if (!hasBefore && !hasAfter) return replaced ? { replaced: true } : {};
+  const redacted = Boolean(before?.valueRedacted || after?.valueRedacted);
+  const evidence = {
+    existingTextLengthBefore: hasBefore ? before.valueLength : undefined,
+    valueLengthAfter: hasAfter ? after.valueLength : undefined,
+    insertedAt: replaced ? "replaced-all" : hasBefore ? inputInsertPosition(before) : undefined,
+  };
+  if (redacted) evidence.valueRedacted = true;
+  else {
+    if (hasBefore) evidence.valueBefore = before.value;
+    if (hasAfter) evidence.valueAfter = after.value;
+  }
+  if (replaced) evidence.replaced = true;
+  return evidence;
 }
 
 async function domFillFallback(tabId, params, cause) {
   if (!(params.selector || params.uid)) throw cause;
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: async (selector, uid, text, submit) => {
@@ -1138,9 +1338,9 @@ async function pollLoop() {
   polling = true;
   try {
     while (true) {
-      const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
+      const response = await fetchWithTimeout(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
         cache: "no-store",
-      });
+      }, POLL_REQUEST_TIMEOUT_MS, "bridge /next");
       if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
       const expected = response.headers.get("x-pi-chrome-version");
       const ours = chrome.runtime.getManifest().version;
@@ -1159,26 +1359,70 @@ async function pollLoop() {
   }
 }
 
+// fetch() with an abort deadline that covers connecting and receiving response headers. The timer is
+// cleared as soon as headers arrive so a late abort can never fail an already-delivered response.
+async function fetchWithTimeout(url, options, timeoutMs, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...(options || {}), signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`${label || "fetch"} timed out after ${timeoutMs}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function commandTimeoutMs(action, params) {
+  if (action !== "cdp.call") return COMMAND_TIMEOUT_MS;
+  // Let the inner CDP deadline fire first so callers see "CDP <method> timed out" instead of the
+  // generic command wrapper timeout.
+  return Math.max(COMMAND_TIMEOUT_MS, cdpCallTimeoutMs(params) + CDP_CALL_GRACE_MS);
+}
+
 async function handleCommand(command) {
+  let payload;
   try {
     const result = await withTimeout(
       dispatch(command.action, command.params ?? {}),
-      COMMAND_TIMEOUT_MS,
+      commandTimeoutMs(command.action, command.params ?? {}),
       command.action || "Chrome command",
       () => detachAll(),
     );
-    await postResult({ id: command.id, ok: true, result });
+    payload = { id: command.id, ok: true, result };
   } catch (error) {
-    await postResult({ id: command.id, ok: false, error: error?.message ?? String(error) });
+    payload = { id: command.id, ok: false, error: error?.message ?? String(error) };
+  }
+  // Post exactly one result. A failed success-post used to fall into the catch above and post a
+  // second (error) result for the same command id.
+  try {
+    await postResult(payload);
+  } catch (error) {
+    console.warn(`[pi-chrome] failed to post result for ${command.action}: ${error?.message ?? String(error)}`);
   }
 }
 
 async function postResult(result) {
-  await fetch(`${BRIDGE_URL}/result`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(result),
-  });
+  const body = JSON.stringify(result);
+  let lastError;
+  for (let attempt = 1; attempt <= RESULT_POST_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetchWithTimeout(`${BRIDGE_URL}/result`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      }, RESULT_REQUEST_TIMEOUT_MS, "bridge /result");
+      // 4xx is final: the bridge no longer knows this command (it already timed out) or rejected
+      // the request. Retrying cannot help.
+      if (response.ok || (response.status >= 400 && response.status < 500)) return;
+      lastError = new Error(`bridge /result HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < RESULT_POST_ATTEMPTS) await sleep(250 * attempt);
+  }
+  throw lastError;
 }
 
 function isVersionOlder(a, b) {
@@ -1285,7 +1529,19 @@ async function dispatch(action, params) {
       await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {
         await bringToFront(tab, params);
-        return await groupTab(tab, groupTitle, params.groupColor);
+        const grouped = await groupTab(tab, groupTitle, params.groupColor);
+        // chrome.tabs.create returns the t=0 tab ({url:"", status:"loading"}), which reads as "the
+        // URL never loaded". Wait (bounded, never throwing) and report the settled tab instead.
+        if (!params.url || params.url === "about:blank") return grouped;
+        const started = Date.now();
+        const settled = await waitForTabSettled(tab.id, SNAPSHOT_NAVIGATION_WAIT_MS);
+        const latest = await chrome.tabs.get(tab.id).catch(() => null);
+        return {
+          ...grouped,
+          tab: latest ? await formatTab(latest) : grouped.tab,
+          loadStatus: settled ? "complete" : "timedOut",
+          waitedMs: Date.now() - started,
+        };
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
         throw error;
@@ -1395,6 +1651,43 @@ async function dispatch(action, params) {
     }
     case "page.screenshot":
       return takeScreenshot(params);
+    case "cdp.targets": {
+      // Diagnostics: CDP targets anchored to the resolved tab, including foreign overlay targets
+      // (password managers, autofill, DevTools front-ends) that explain "Detached while handling
+      // command" failures. Never creates an automation window. Only the resolved tab's targets are
+      // echoed; targets on other tabs are counted, not listed.
+      const hasSelector = params.targetId !== undefined || Boolean(params.urlIncludes) || Boolean(params.titleIncludes);
+      const tab = await getTabByParams(params, { createOwnedTarget: false }).catch((error) => {
+        if (hasSelector) throw error;
+        return null;
+      });
+      const allTargets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+      const targets = tab ? allTargets.filter((t) => t.tabId === tab.id) : [];
+      return {
+        tab: tab ? { id: tab.id, windowId: tab.windowId, url: tab.url, title: tab.title } : null,
+        targets: targets.map((t) => ({ id: t.id, tabId: t.tabId, type: t.type, url: t.url, title: t.title, attached: t.attached, extensionId: t.extensionId })),
+        otherTabTargetCount: allTargets.filter((t) => typeof t.tabId === "number" && t.tabId !== tab?.id).length,
+      };
+    }
+    case "cdp.call": {
+      // Validate before touching the debugger: a clear error beats Chrome's opaque
+      // "Invalid parameters" for a missing method or non-object params.
+      if (typeof params.method !== "string" || !params.method.trim()) {
+        throw new Error('cdp.call requires a non-empty string "method" (for example "Runtime.evaluate" or "DOM.getDocument").');
+      }
+      if (params.params !== undefined && params.params !== null && (typeof params.params !== "object" || Array.isArray(params.params))) {
+        throw new Error('cdp.call "params" must be a plain object of CDP parameters when provided.');
+      }
+      const method = params.method.trim();
+      // Background mode is a hard policy. Raw CDP must not become a way around it.
+      if (!foregroundRequested(params) && CDP_FOCUS_METHODS.has(method)) {
+        throw new Error(`${method} is blocked by background mode because it focuses or activates a tab. Ask the user to run /chrome background off to allow foreground work.`);
+      }
+      const tab = await getTabByParams(params);
+      await bringToFront(tab, params);
+      await attachDebugger(tab.id);
+      return await cdp(tab.id, method, params.params ?? {}, { timeoutMs: cdpCallTimeoutMs(params) });
+    }
     case "automation.status": {
       // Report this session's owned automation target (ids only). Used for diagnostics/tests.
       await hydrateAutomationTargets();
@@ -1557,7 +1850,7 @@ async function executeInTab(params, func, args) {
   // Phase 2: run the action via chrome.scripting.executeScript. The `func:` form is
   // injected by Chrome itself (not `new Function`), so it is CSP-safe, and it lets Chrome
   // serialize the invocation args. The wrapper references window.__piAction defined above.
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId: tab.id },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -1639,13 +1932,45 @@ async function evaluateInTab(params) {
   return v;
 }
 
+// Run an input action, then optionally snapshot. An action that starts a navigation (Enter submits a
+// form, a click follows a link) used to be snapshotted immediately, so the snapshot described the
+// OUTGOING document and read as "the action did nothing". Anchor the tab's url/status first; when
+// the action plausibly started a load, wait (bounded) for it before snapshotting and report
+// navigation {from, to, settled, waitedMs}. A timeout never fails the action. A tab that was already
+// loading with the same URL is reported but not waited on, so a hanging subresource cannot add a wait
+// to every action.
+const SNAPSHOT_NAVIGATION_WAIT_MS = 5_000;
 async function withOptionalSnapshot(params, actionFn) {
-  const result = await actionFn(params);
-  if (params.includeSnapshot) {
-    const snapshot = await snapshotInTab({ ...params, foreground: false });
-    return { result, snapshot };
+  if (!params.includeSnapshot) return actionFn(params);
+  let anchor = null;
+  try {
+    const tab = await getTabByParams(params);
+    if (tab && typeof tab.id === "number") {
+      anchor = { tabId: tab.id, params: { ...params, targetId: String(tab.id) }, url: String(tab.url ?? ""), status: String(tab.status ?? "") };
+    }
+  } catch {
+    anchor = null; // Let the action surface the targeting error itself.
   }
-  return result;
+  const result = await actionFn(anchor ? anchor.params : params);
+  let navigation;
+  if (anchor) {
+    const after = await chrome.tabs.get(anchor.tabId).catch(() => null);
+    const afterUrl = String(after?.url ?? "");
+    const urlChanged = Boolean(afterUrl && afterUrl !== anchor.url);
+    const loading = after?.status === "loading";
+    if (urlChanged || loading) {
+      const started = Date.now();
+      const startedLoading = loading && (urlChanged || anchor.status === "complete");
+      let settled = !loading;
+      if (startedLoading) {
+        settled = await waitForTabSettled(anchor.tabId, SNAPSHOT_NAVIGATION_WAIT_MS);
+      }
+      const finalTab = await chrome.tabs.get(anchor.tabId).catch(() => after);
+      navigation = { from: anchor.url, to: String(finalTab?.url ?? afterUrl), settled, waitedMs: Date.now() - started };
+    }
+  }
+  const snapshot = await snapshotInTab({ ...(anchor ? anchor.params : params), foreground: false });
+  return navigation ? { result, snapshot, navigation } : { result, snapshot };
 }
 
 // Snapshot/inspect run from a packaged MAIN-world script (snapshot_injected.js) injected via
@@ -1664,12 +1989,12 @@ async function snapshotInTab(params) {
     params.query ?? null,
     params.maxTextChars ?? null,
   ];
-  await executeScriptTimed({
+  await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
   }, `inject snapshot script in tab ${tab.id}`);
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -1700,12 +2025,12 @@ async function inspectInTab(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   const args = [params.uid ?? null, params.selector ?? null, params.scrollIntoView === true];
-  await executeScriptTimed({
+  await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
   }, `inject inspect script in tab ${tab.id}`);
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -1793,6 +2118,31 @@ function waitForTabComplete(tabId, timeoutMs) {
       }
     };
     chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+// Like waitForTabComplete, but for a load that may already be underway (or already finished):
+// re-checks the tab after subscribing so a completion between the caller's read and the listener
+// registration is not missed. Resolves true when complete, false on timeout; never throws.
+function waitForTabSettled(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish(true);
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (!tab) finish(false);
+      else if (tab.status === "complete") finish(true);
+    }, () => finish(false));
   });
 }
 
