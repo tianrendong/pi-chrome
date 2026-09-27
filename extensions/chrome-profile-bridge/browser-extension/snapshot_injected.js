@@ -125,15 +125,7 @@
         level,
         timestamp: Date.now(),
         url: location.href,
-        args: Array.from(args).map((arg) => {
-          try {
-            if (typeof arg === "string") return arg;
-            if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-            return JSON.parse(JSON.stringify(arg));
-          } catch {
-            return String(arg);
-          }
-        }),
+        args: Array.from(args), // raw; serialized on read by listConsoleMessages
       });
       if (state.console.length > 500) state.console.splice(0, state.console.length - 500);
     };
