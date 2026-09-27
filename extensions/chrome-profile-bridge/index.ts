@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readdir, unlink, writeFile } from "node:fs/promises";
@@ -801,6 +802,14 @@ const CHROME_TOOL_NAMES = [
 	"chrome_cdp_targets",
 ] as const;
 const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
+const CHROME_TOOL_CHANGE_ENTRY = "pi-chrome-tool-change";
+type ChromeToolChangeEntry = {
+	content: string;
+	action: "authorized" | "reauthorized" | "revoked" | "expired";
+	tools: string[];
+	authorizedUntil?: number | "indefinite";
+	at: number;
+};
 
 function StringEnum<T extends readonly [string, ...string[]]>(values: T) {
 	return Type.Union(values.map((value) => Type.Literal(value)) as [ReturnType<typeof Type.Literal>, ...ReturnType<typeof Type.Literal>[]]);
@@ -890,17 +899,15 @@ export default function (pi: ExtensionAPI): void {
 				: action === "expired"
 					? "Chrome tools disabled because /chrome authorize grant expired."
 					: "Chrome tools disabled by /chrome revoke.";
-		pi.sendMessage({
-			customType: "pi-chrome-tool-change",
+		// Session-history log only (custom entry, not sent to the model). The model already learns about
+		// the change from pi's tool/prompt-section delta, so a model-facing message would be redundant.
+		pi.appendEntry<ChromeToolChangeEntry>(CHROME_TOOL_CHANGE_ENTRY, {
 			content,
-			display: true,
-			details: {
-				action,
-				tools: [...CHROME_TOOL_NAMES],
-				authorizedUntil: options.authorizedUntil,
-				at: Date.now(),
-			},
-		}, { triggerTurn: false });
+			action,
+			tools: [...CHROME_TOOL_NAMES],
+			authorizedUntil: options.authorizedUntil,
+			at: Date.now(),
+		});
 	};
 
 	// Bound the entire request, including shared-owner forwarding/takeover. Revoke can launch
@@ -1088,6 +1095,12 @@ export default function (pi: ExtensionAPI): void {
 		updateChromeStatus(ctx);
 	});
 
+	// Render authorization log entries in the transcript. Custom entries never reach the model.
+	pi.registerEntryRenderer?.<ChromeToolChangeEntry>(CHROME_TOOL_CHANGE_ENTRY, (entry, _options, theme) => {
+		const content = entry.data?.content ?? "Chrome authorization changed.";
+		return new Text(theme.fg("dim", `[pi-chrome] ${content}`), 1, 0);
+	});
+
 	pi.on("session_shutdown", async (event) => {
 		clearAuthExpiryTimer();
 		clearCountdownInterval();
@@ -1100,13 +1113,26 @@ export default function (pi: ExtensionAPI): void {
 		}
 	});
 
+	// Contribute the primer as a named prompt section instead of returning `systemPrompt`.
+	// Returning `systemPrompt` forces a whole-prompt override, which makes pi collapse every system
+	// message into a new leading prompt each run (busting the provider prompt cache and disabling
+	// pi's append-only section/tool deltas for all extensions). Mutating `systemPromptOptions.sections`
+	// lets pi diff the section and append a small system-message delta when it appears/disappears.
 	pi.on("before_agent_start", (event) => {
-		if (!chromeToolsRegistered || !chromeControlAuthorized()) {
-			return { systemPrompt: event.systemPrompt };
+		const active = chromeToolsRegistered && chromeControlAuthorized();
+		const sections = (event as { systemPromptOptions?: { sections?: Record<string, string> } }).systemPromptOptions?.sections;
+		if (sections) {
+			if (active) sections[CHROME_PRIMER_SECTION] = CHROME_PRIMER;
+			else delete sections[CHROME_PRIMER_SECTION];
+			return undefined;
 		}
-		const primer = `
-<chrome-profile-bridge>
-Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile: no remote-debug port, no throwaway profile.
+		// Legacy pi without structured prompt sections: append the primer to the rendered prompt.
+		if (!active) return undefined;
+		return { systemPrompt: `${event.systemPrompt}\n<${CHROME_PRIMER_SECTION}>\n${CHROME_PRIMER}\n</${CHROME_PRIMER_SECTION}>` };
+	});
+
+	const CHROME_PRIMER_SECTION = "chrome-profile-bridge";
+	const CHROME_PRIMER = `Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile: no remote-debug port, no throwaway profile.
 
 Tab/window isolation (important):
 - pi-chrome owns a dedicated automation window/tab. When a chrome_* tool runs with no explicit target, it acts on that pi-chrome-owned target — it never reuses or overwrites the user's currently active tab. The dedicated target is created on first use and reused afterward.
@@ -1130,10 +1156,7 @@ Usage rules:
 5. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
 6. /chrome background on (default) is a hard policy: per-call \`background=false\` cannot override it, new tabs stay inactive, and \`chrome_tab activate\` is blocked. Ask the user to run /chrome background off when they want foreground/watch mode. With background off, per-call \`background=true\` still avoids explicit focus/tab activation. Screenshots use CDP without activating background tabs; debugger failures never fall back to tab activation. Page scripts, trusted input, native prompts, and Chrome/OS behavior can still affect focus.
 7. If you hit a native file-picker or privileged browser prompt gate, tell the user; generic clicks/typing/CSP gates are handled by Chrome input.
-8. Run /chrome doctor when in doubt about connectivity or capabilities.
-</chrome-profile-bridge>`;
-		return { systemPrompt: event.systemPrompt + primer };
-	});
+8. Run /chrome doctor when in doubt about connectivity or capabilities.`;
 
 	// Shared handlers, dispatched by the unified /chrome command below.
 	const doctorHandler = async (ctx: ExtensionContext) => {
