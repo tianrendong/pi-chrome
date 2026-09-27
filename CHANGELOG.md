@@ -6,6 +6,9 @@ All notable user-facing changes to `pi-chrome`.
 
 - **Console capture no longer breaks sites with DevTools detection (#9).** Some sites (BOSS Zhipin) log an object with a getter or custom `toString` and close the tab if anything reads it, since only open DevTools would. The console capture serialized every logged argument immediately, so it tripped the check. Captured arguments are now stored as-is, and `chrome_list_console_messages` serializes them without running page code: data properties only, accessors shown as `[getter]`, and DOM nodes, regexes, dates and errors described through Chrome's native getters.
 - **Early capture only in Pi's tabs.** The document-start console/network capture used to be injected into every page you opened. It now runs only in Pi's automation tab and in tabs tracked for a Pi session. Other tabs are not touched until a Pi tool acts on them.
+- **Prompt-cache-friendly primer.** The Chrome primer is now contributed as a structured `chrome-profile-bridge` prompt section instead of a forced `systemPrompt` override. Previously the `before_agent_start` handler returned `systemPrompt` on every run (even while locked), which made pi collapse all system messages into a freshly rendered leading prompt each run. That disabled pi's append-only prompt/tool deltas for the whole session and busted the provider prompt cache when `/chrome authorize`, revoke, or expiry toggled the primer. Pi now appends a small section delta instead. Older pi versions without structured sections keep the previous append behavior.
+- **Authorization log stays out of model context.** `pi-chrome-tool-change` records (authorize, reauthorize, revoke, expiry) are now session custom entries rendered in the transcript instead of model-facing custom messages. The model already sees the change through pi's tool and prompt-section delta, so the message was redundant context.
+- **Validation.** New `prompt-section` unit suite.
 
 ## 0.15.54 — 2026-09-26
 
