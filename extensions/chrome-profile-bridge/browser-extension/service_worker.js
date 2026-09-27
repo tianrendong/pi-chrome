@@ -2293,14 +2293,22 @@ async function unregisterInitScript(tabId) {
   await cdp(tabId, "Page.removeScriptToEvaluateOnNewDocument", { identifier }).catch(() => undefined);
 }
 
-// Always inject early console/network capture at document_start on every navigation.
-// Catches console messages, errors, and network requests that fire during page load,
-// before chrome_snapshot or chrome_evaluate install the instrumentation normally.
-// The function installEarlyCapture sets __piChromeWrapped flags so the post-hoc
-// installPiChromeInstrumentation() call is idempotent.
+// Inject early console/network capture at document_start, but only into tabs Pi owns or has used
+// (its automation tab and tabs tracked for a session). Your other tabs are never patched. Catches
+// console messages, errors, and network requests that fire during page load, before chrome_snapshot
+// or chrome_evaluate install the instrumentation normally. installEarlyCapture sets __piChromeWrapped
+// flags so the post-hoc installPiChromeInstrumentation() call is idempotent.
+async function isPiTrackedTab(tabId) {
+  await Promise.all([hydrateAutomationTargets(), hydrateSessionTabs()]);
+  if (isPiChromeOwnedTarget(tabId)) return true;
+  for (const tabs of sessionTabs.values()) if (tabs.has(tabId)) return true;
+  return false;
+}
+
 if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
-  chrome.webNavigation.onCommitted.addListener((details) => {
+  chrome.webNavigation.onCommitted.addListener(async (details) => {
     if (details.frameId !== 0) return;
+    if (!(await isPiTrackedTab(details.tabId).catch(() => false))) return;
     chrome.scripting.executeScript({
       target: { tabId: details.tabId, frameIds: [0] },
       world: "MAIN",
@@ -2592,15 +2600,9 @@ function installPiChromeInstrumentation() {
       level,
       timestamp: Date.now(),
       url: location.href,
-      args: Array.from(args).map((arg) => {
-        try {
-          if (typeof arg === "string") return arg;
-          if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-          return JSON.parse(JSON.stringify(arg));
-        } catch {
-          return String(arg);
-        }
-      }),
+      // Keep the raw values and serialize only when Pi lists messages. Serializing here reads every
+      // logged object (getters, toString), which is exactly what anti-DevTools checks watch for.
+      args: Array.from(args),
     });
     if (state.console.length > 500) state.console.splice(0, state.console.length - 500);
   };
@@ -2715,15 +2717,7 @@ function installEarlyCapture() {
       level: level,
       timestamp: Date.now(),
       url: location.href,
-      args: Array.from(args).map(function(arg) {
-        try {
-          if (typeof arg === "string") return arg;
-          if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-          return JSON.parse(JSON.stringify(arg));
-        } catch (e) {
-          return String(arg);
-        }
-      }),
+      args: Array.from(args), // raw; serialized on read (see listConsoleMessages)
     });
     if (state.console.length > 500) state.console.splice(0, state.console.length - 500);
   }
@@ -2917,7 +2911,7 @@ async function clickPage(selector, uid, x, y) {
       // Inspect recent console errors for activation-gate rejections.
       const recent = (state.console || []).slice(-8);
       const hit = recent.find((e) => /NotAllowedError|Document is not focused|requires transient activation|gesture is required/.test(
-        (e.args || []).map((a) => typeof a === "string" ? a : (a && a.message) || JSON.stringify(a)).join(" ")
+        (e.args || []).map((a) => typeof a === "string" ? a : a instanceof Error ? a.message : "").join(" ")
       ));
       if (hit) { suggestChromeInput = true; suggestReason = "recent console error indicates user-activation gate"; }
     }
@@ -3285,7 +3279,85 @@ async function pressKeyInPage(key) {
 function listConsoleMessages(clear) {
   installPiChromeInstrumentation();
   const state = getPiChromeState();
-  const messages = state.console.slice();
+  // Serialize without running page code. Anti-DevTools checks log objects with getters or a custom
+  // toString and treat any call as "DevTools is open" (issue #9). Copy data properties only, report
+  // accessors as "[getter]" without calling them, and describe built-ins through native getters.
+  const nativeSource = Function.prototype.toString;
+  const isNative = (fn) => { try { return typeof fn === "function" && nativeSource.call(fn).includes("[native code]"); } catch { return false; } };
+  const protoGetter = (proto, key) => { try { return Object.getOwnPropertyDescriptor(proto, key)?.get; } catch { return undefined; } };
+  const callGetter = (proto, key, value) => { const get = protoGetter(proto, key); return get ? get.call(value) : undefined; };
+  const dataProp = (value, key) => {
+    for (let obj = value, hops = 0; obj && hops < 20; obj = Object.getPrototypeOf(obj), hops++) {
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (!desc) continue;
+      if ("value" in desc) return { ok: true, value: desc.value };
+      return isNative(desc.get) ? { ok: true, value: desc.get.call(value) } : { ok: false };
+    }
+    return { ok: true, value: undefined };
+  };
+  const serialize = (value, depth = 0, seen = new Set()) => {
+    try {
+      const type = typeof value;
+      if (value === null || type === "string" || type === "boolean") return value;
+      if (type === "number") return Number.isFinite(value) ? value : String(value);
+      if (type === "undefined") return "undefined";
+      if (type === "bigint") return `${BigInt.prototype.toString.call(value)}n`;
+      if (type === "symbol") return Symbol.prototype.toString.call(value);
+      if (type === "function") {
+        const name = dataProp(value, "name");
+        return `[function ${name.ok && typeof name.value === "string" && name.value ? name.value : "anonymous"}]`;
+      }
+      if (seen.has(value)) return "[circular]";
+      if (value instanceof Error) {
+        const out = {};
+        for (const key of ["name", "message"]) {
+          const prop = dataProp(value, key);
+          out[key] = prop.ok ? (typeof prop.value === "string" ? prop.value : serialize(prop.value, depth + 1, seen)) : "[getter]";
+        }
+        // V8 formats `stack` lazily from name/message, so only read it when both are plain data.
+        const stack = out.name !== "[getter]" && out.message !== "[getter]" ? dataProp(value, "stack") : { ok: false };
+        out.stack = stack.ok ? (typeof stack.value === "string" ? stack.value : undefined) : "[getter]";
+        return out;
+      }
+      if (value instanceof Date) return Date.prototype.toISOString.call(value);
+      if (value instanceof RegExp) return `/${callGetter(RegExp.prototype, "source", value)}/${callGetter(RegExp.prototype, "flags", value)}`;
+      if (typeof Node !== "undefined" && value instanceof Node) {
+        const name = String(callGetter(Node.prototype, "nodeName", value) || "node").toLowerCase();
+        if (typeof Element === "undefined" || !(value instanceof Element)) return `<${name}>`;
+        const id = callGetter(Element.prototype, "id", value);
+        const cls = String(callGetter(Element.prototype, "className", value) || "").trim().split(/\s+/).filter(Boolean).slice(0, 3);
+        return `<${name}${id ? `#${id}` : ""}${cls.map((c) => `.${c}`).join("")}>`;
+      }
+      if (value instanceof Map) return `[Map(${callGetter(Map.prototype, "size", value)})]`;
+      if (value instanceof Set) return `[Set(${callGetter(Set.prototype, "size", value)})]`;
+      if (depth >= 4) return Array.isArray(value) ? "[array]" : "[object]";
+      seen.add(value);
+      if (Array.isArray(value)) {
+        const length = dataProp(value, "length");
+        const n = length.ok ? Math.min(Number(length.value) || 0, 50) : 0;
+        const out = [];
+        for (let i = 0; i < n; i++) {
+          const item = dataProp(value, String(i));
+          out.push(item.ok ? serialize(item.value, depth + 1, seen) : "[getter]");
+        }
+        if (length.ok && length.value > 50) out.push(`[${length.value - 50} more]`);
+        seen.delete(value);
+        return out;
+      }
+      const out = {};
+      const keys = Object.keys(value);
+      for (const key of keys.slice(0, 50)) {
+        const desc = Object.getOwnPropertyDescriptor(value, key);
+        out[key] = desc && "value" in desc ? serialize(desc.value, depth + 1, seen) : "[getter]";
+      }
+      if (keys.length > 50) out["…"] = `${keys.length - 50} more keys`;
+      seen.delete(value);
+      return out;
+    } catch {
+      return "[unserializable]";
+    }
+  };
+  const messages = state.console.map((entry) => ({ ...entry, args: Array.from(entry.args || [], (arg) => serialize(arg)) }));
   if (clear) state.console = [];
   return { messages, count: messages.length };
 }

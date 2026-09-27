@@ -2,6 +2,11 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## Unreleased
+
+- **Console capture no longer breaks sites with DevTools detection (#9).** Some sites (BOSS Zhipin) log an object with a getter or custom `toString` and close the tab if anything reads it, since only open DevTools would. The console capture serialized every logged argument immediately, so it tripped the check. Captured arguments are now stored as-is, and `chrome_list_console_messages` serializes them without running page code: data properties only, accessors shown as `[getter]`, and DOM nodes, regexes, dates and errors described through Chrome's native getters.
+- **Early capture only in Pi's tabs.** The document-start console/network capture used to be injected into every page you opened. It now runs only in Pi's automation tab and in tabs tracked for a Pi session. Other tabs are not touched until a Pi tool acts on them.
+
 ## 0.15.54 — 2026-09-26
 
 - **Hidden tabs report instead of silently dropping input.** Chrome ignores trusted input to hidden pages. A page is hidden when it is an inactive tab, its window is minimized, its window is fully covered by another window, or (on macOS) its window became a hidden window tab behind a full-screen window. In a hidden page, mouse presses and keys were dropped while the tool reported success, and mouse moves could hang until a timeout (the source of `Detached while handling command` in background runs). Input tools now check page visibility first. `chrome_type`, `chrome_key`, `chrome_hover`, `chrome_scroll`, `chrome_tap` and `chrome_drag` fail fast with the reason and the options (`background:false`, or `/chrome background off`). `chrome_click` and `chrome_fill` go straight to their existing DOM fallback and report the reason, or reject with `domFallback:false`. Hard background mode is unchanged: nothing is activated or focused.
