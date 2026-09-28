@@ -87,14 +87,17 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         // Chrome closes a window automatically when its final tab is removed.
         if (tab && ![...tabs.values()].some((other) => other.windowId === tab.windowId)) windows.delete(tab.windowId);
       },
-      group: async ({ groupId, tabIds = [] } = {}) => {
+      // Like Chrome: a new group goes into createProperties.windowId, else the *current* window
+      // (the user's), and grouped tabs move into the group's window.
+      group: async ({ groupId, tabIds = [], createProperties } = {}) => {
         let gid = groupId;
         if (typeof gid !== "number") {
           gid = alloc.group();
-          const firstTab = tabs.get(tabIds[0]);
-          groups.set(gid, { id: gid, title: "", color: "grey", collapsed: false, windowId: firstTab ? firstTab.windowId : userWindowId });
+          const windowId = typeof createProperties?.windowId === "number" ? createProperties.windowId : userWindowId;
+          groups.set(gid, { id: gid, title: "", color: "grey", collapsed: false, windowId });
         }
-        for (const tid of tabIds) { const t = tabs.get(tid); if (t) t.groupId = gid; }
+        const groupWindow = groups.get(gid).windowId;
+        for (const tid of tabIds) { const t = tabs.get(tid); if (t) { t.groupId = gid; t.windowId = groupWindow; } }
         return gid;
       },
       ungroup: async (id) => { const ids = Array.isArray(id) ? id : [id]; for (const tid of ids) { const t = tabs.get(tid); if (t) t.groupId = -1; } },
