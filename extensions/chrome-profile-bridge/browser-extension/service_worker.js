@@ -1232,11 +1232,16 @@ async function chromeInputFill(params) {
       await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
       await sleep(rng(20, 60));
     }
-    await contentEditableInTab(tab.id, params);
-    // Delete selection.
-    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
-    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
-    await sleep(rng(20, 60));
+    if (await contentEditableInTab(tab.id, params)) {
+      // The requested editor's whole contents are already selected; delete the selection.
+      await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+      await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+      await sleep(rng(20, 60));
+    } else {
+      // A triple-click selects only one line of a multi-line textarea. Select the whole value with
+      // Chrome's selectAll editing command before deleting.
+      await selectAllAndDelete(tab.id);
+    }
     const text = String(params.text || "");
     const typing = await typeTextInTab(tab.id, text, params.perCharacter);
     if (params.submit) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
@@ -1743,8 +1748,20 @@ async function dispatch(action, params) {
       const existingGroup = await findGroupRecordByTitle(groupTitle);
       const createParams = { url: params.url || "about:blank", active: foregroundRequested(params) };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
-      const tab = await chrome.tabs.create(createParams);
-      await trackSessionTab(sessionKeyOf(params), tab.id, true);
+      // Register the creation as in flight until the tab is tracked, so early capture (which only
+      // runs in tracked tabs) waits for it instead of skipping the new tab's first page load.
+      const creation = (async () => {
+        const created = await chrome.tabs.create(createParams);
+        await trackSessionTab(sessionKeyOf(params), created.id, true);
+        return created;
+      })();
+      pendingTabCreations.add(creation);
+      let tab;
+      try {
+        tab = await creation;
+      } finally {
+        pendingTabCreations.delete(creation);
+      }
       try {
         await bringToFront(tab, params);
         const grouped = await groupTab(tab, groupTitle, params.groupColor);
@@ -2298,8 +2315,12 @@ async function unregisterInitScript(tabId) {
 // console messages, errors, and network requests that fire during page load, before chrome_snapshot
 // or chrome_evaluate install the instrumentation normally. installEarlyCapture sets __piChromeWrapped
 // flags so the post-hoc installPiChromeInstrumentation() call is idempotent.
+const pendingTabCreations = new Set(); // in-flight Pi tab creations, resolved once tracked
+
 async function isPiTrackedTab(tabId) {
   await Promise.all([hydrateAutomationTargets(), hydrateSessionTabs()]);
+  // A tab Pi is creating right now can commit its first page before tab.new has tracked it.
+  if (pendingTabCreations.size) await Promise.allSettled([...pendingTabCreations]);
   if (isPiChromeOwnedTarget(tabId)) return true;
   for (const tabs of sessionTabs.values()) if (tabs.has(tabId)) return true;
   return false;

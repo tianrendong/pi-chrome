@@ -4,6 +4,9 @@ All notable user-facing changes to `pi-chrome`.
 
 ## Unreleased
 
+- **`chrome_fill` replaces all of a multi-line textarea.** Fill selected the old value with a triple-click, which in a textarea selects only the clicked line. The rest stayed, and the tool still reported success. Inputs and textareas now select the whole value with Chrome's `selectAll` editing command before deleting. Contenteditables are unchanged.
+- **Early capture covers a new tab's first page.** `chrome_tab new` could commit its first page before the tab was recorded as Pi's, so early console/network capture skipped that load. Early capture now waits for in-flight Pi tab creations before deciding.
+
 ## 0.15.55 — 2026-09-26
 
 - **Console capture no longer breaks sites with DevTools detection (#9).** Some sites (BOSS Zhipin) log an object with a getter or custom `toString` and close the tab if anything reads it, since only open DevTools would. The console capture serialized every logged argument immediately, so it tripped the check. Captured arguments are now stored as-is, and `chrome_list_console_messages` serializes them without running page code: data properties only, accessors shown as `[getter]`, and DOM nodes, regexes, dates and errors described through Chrome's native getters.

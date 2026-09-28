@@ -215,6 +215,18 @@ for (const perCharacter of [false, true]) {
   });
 }
 
+test("fill selects a textarea's whole value with the selectAll command, not just the clicked line", async () => {
+  const h = harness({ tag: "TEXTAREA", editable: false });
+  const result = await h.call("fill", { selector: "#target", text: "NEW", domFallback: false });
+  assert.equal(result.input, "chrome");
+  const keys = h.commands("Input.dispatchKeyEvent");
+  const selectAll = keys.findIndex((c) => (c.params.commands || []).includes("selectAll"));
+  const del = keys.findIndex((c) => c.params.key === "Delete" && c.params.type === "keyDown");
+  assert.ok(selectAll >= 0, "selectAll editing command sent");
+  assert.ok(del > selectAll, "delete follows select-all");
+  assert.equal(h.selected.length, 0, "no DOM range selection for value fields");
+});
+
 test("fill refuses to select an unrelated focused editor", async () => {
   const h = harness({ initial: "keep this" });
   h.page.document.activeElement = { isContentEditable: true, contains: () => false };

@@ -20,7 +20,8 @@ function loadWorker() {
     debugger: { onDetach: noop, onEvent: noop },
     storage: { session: { get: async () => ({}), set: async () => {} } },
     scripting: { executeScript: async (options) => { injected.push(options); return []; } },
-    tabs: { get: async () => null },
+    tabs: { get: async () => null, create: async () => { throw new Error("not mocked"); } },
+    tabGroups: { query: async () => [] },
   };
   const w = { chrome, console, setTimeout, clearTimeout, setInterval: () => 0, navigator: { userAgent: "unit-test" }, fetch: async () => { throw new Error("offline"); } };
   w.self = w;
@@ -119,4 +120,22 @@ test("early capture is injected only into tabs Pi owns or tracks", async () => {
   await h.commit(11, 3); // subframe
   assert.deepEqual(h.injected.map((o) => o.target.tabId), [11, 12]);
   assert.ok(h.injected.every((o) => o.func.name === "installEarlyCapture" && o.injectImmediately === true));
+});
+
+test("a Pi tab whose first page commits before tab.new tracks it still gets early capture", async () => {
+  const h = loadWorker();
+  let commit;
+  h.w.chrome.tabs.create = async (props) => {
+    // Chrome can commit the first document while tab.new is still recording ownership.
+    commit = h.commit(21);
+    return { id: 21, windowId: 1, url: props.url, status: "loading" };
+  };
+  h.w.groupTab = async (tab) => ({ tab: { id: tab.id }, group: { title: "Pi" } });
+  h.w.waitForTabSettled = async () => true;
+  h.w.formatTab = async (tab) => tab;
+  await h.w.dispatch("tab.new", { url: "https://site.test/", background: true, sessionKey: "s" });
+  await commit;
+  assert.deepEqual(h.injected.map((o) => o.target.tabId), [21]);
+  await h.commit(22);
+  assert.deepEqual(h.injected.map((o) => o.target.tabId), [21], "unrelated tabs stay untouched");
 });
