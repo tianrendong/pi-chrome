@@ -4,6 +4,8 @@ All notable user-facing changes to `pi-chrome`.
 
 ## Unreleased
 
+## 0.15.56 — 2026-09-28
+
 - **`chrome_fill` replaces all of a multi-line textarea.** Fill selected the old value with a triple-click, which in a textarea selects only the clicked line. The rest stayed, and the tool still reported success. Inputs and textareas now select the whole value with Chrome's `selectAll` editing command before deleting. Contenteditables are unchanged.
 - **Early capture covers a new tab's first page.** `chrome_tab new` could commit its first page before the tab was recorded as Pi's, so early console/network capture skipped that load. Early capture now waits for in-flight Pi tab creations before deciding.
 
