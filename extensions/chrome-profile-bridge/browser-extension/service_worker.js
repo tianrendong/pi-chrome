@@ -1711,10 +1711,14 @@ async function groupTab(tab, title, color) {
   const groupTitle = cleanGroupTitle(title);
   let groupId = tab.groupId;
   if (typeof groupId !== "number" || groupId < 0) {
-    const existing = await findGroupByTitle(tab.windowId, groupTitle);
+    // Some browsers omit windowId on freshly created tabs; read it back instead of guessing.
+    const windowId = typeof tab.windowId === "number" ? tab.windowId : (await chrome.tabs.get(tab.id).catch(() => null))?.windowId;
+    const existing = await findGroupByTitle(windowId, groupTitle);
+    // Without createProperties.windowId Chrome creates the group in the *current* (user's) window
+    // and moves the tab there, pulling Pi's automation tab out of its own window as a hidden tab.
     groupId = existing !== null
       ? await chrome.tabs.group({ groupId: existing, tabIds: [tab.id] })
-      : await chrome.tabs.group({ tabIds: [tab.id] });
+      : await chrome.tabs.group(typeof windowId === "number" ? { tabIds: [tab.id], createProperties: { windowId } } : { tabIds: [tab.id] });
   }
   await chrome.tabGroups.update(groupId, { title: groupTitle, color: cleanGroupColor(color), collapsed: false });
   const grouped = await chrome.tabs.get(tab.id);
