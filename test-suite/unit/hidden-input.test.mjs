@@ -111,15 +111,15 @@ test("visible pages, failed probes, and foreground tabs that become visible proc
 });
 
 // ---- automation target placement ----
-test("automation targets use a background tab, not a new window, while the user's window is full screen", async () => {
-  const full = worker({ win: { id: 1, state: "fullscreen" } });
-  await full.w.createAutomationTarget("s1", undefined);
-  assert.equal(full.calls.some((c) => c.method === "windows.create"), false);
-  assert.deepEqual(clone(full.calls.find((c) => c.method === "tabs.create").props), { url: "about:blank", active: false });
-
-  const normal = worker({ win: { id: 1, state: "maximized" } });
-  await normal.w.createAutomationTarget("s2", undefined);
-  assert.deepEqual(clone(normal.calls.find((c) => c.method === "windows.create").props), { url: "about:blank", focused: false });
+test("automation targets get their own window even while the user's window is full screen", async () => {
+  // Chrome disables macOS automatic window tabbing, so a new window is never merged into the user's
+  // full-screen window; putting Pi's tab in the user's window would only lose isolation.
+  for (const state of ["fullscreen", "maximized"]) {
+    const h = worker({ win: { id: 1, state } });
+    await h.w.createAutomationTarget(`s-${state}`, undefined);
+    assert.deepEqual(clone(h.calls.find((c) => c.method === "windows.create").props), { url: "about:blank", focused: false }, state);
+    assert.equal(h.calls.some((c) => c.method === "tabs.create"), false, state);
+  }
 });
 
 // ---- input.debug ----
