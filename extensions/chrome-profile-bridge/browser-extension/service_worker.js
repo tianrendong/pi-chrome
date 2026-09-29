@@ -1985,7 +1985,24 @@ async function dispatch(action, params) {
       // Report this session's owned automation target (ids only). Used for diagnostics/tests.
       await hydrateAutomationTargets();
       const t = automationTargets.get(sessionKeyOf(params));
-      return { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
+      const status = { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
+      if (!params.includeVisibility || !t) return status;
+      // For /chrome doctor: is this session's own tab visible? Never creates or activates anything.
+      const tab = await chrome.tabs.get(t.tabId).catch(() => null);
+      if (!tab) return { ...status, tabId: null };
+      const results = await executeScriptWithFallback({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "MAIN",
+        func: () => document.visibilityState,
+      }, `read visibility of tab ${tab.id}`).catch(() => null);
+      const visibility = typeof results?.[0]?.result === "string" ? results[0].result : "unknown";
+      const win = typeof chrome.windows?.get === "function" ? await chrome.windows.get(tab.windowId).catch(() => null) : null;
+      return {
+        ...status,
+        visibility,
+        url: tab.url,
+        hiddenReason: visibility === "hidden" ? hiddenTabReason(tab, win) : undefined,
+      };
     }
     case "automation.cleanup":
       // Close recorded creations, and only ungroup user tabs still in their adopted group.

@@ -1219,6 +1219,25 @@ Usage rules:
 				} catch (error) {
 					lines.push(`⚠ Couldn't inspect the active tab: ${(error as Error).message}`);
 				}
+
+				// Pi's own tab for this session: hidden pages ignore clicks and typing, so say so up front.
+				try {
+					const own = (await bridge.send("automation.status", { sessionKey: sessionKeyFor(ctx), includeVisibility: true }, 10_000)) as
+						| { tabId?: number | null; visibility?: string; hiddenReason?: string }
+						| undefined;
+					if (own?.tabId === null || own?.tabId === undefined) {
+						lines.push(`• Pi hasn't opened its own tab in this session yet.`);
+					} else if (own.visibility === "hidden") {
+						lines.push(
+							`⚠ Pi's tab is hidden because ${own.hiddenReason ?? "its window is not visible"}. Chrome ignores clicks and typing in hidden tabs, so those tools will fail until it's visible.`,
+							`  Fix: bring Pi's window forward or uncover it, or run /chrome background off to let Pi bring it forward.`,
+						);
+					} else if (own.visibility === "visible") {
+						lines.push(`✓ Pi's tab is visible, so clicks and typing will reach it.`);
+					}
+				} catch {
+					// Older extensions or a closed tab: nothing useful to add.
+				}
 			} else if (versionMismatch) {
 				lines.push(`… Skipped the remaining checks until you reload the Chrome extension.`);
 			}

@@ -24,6 +24,7 @@ function healthyResponse(action) {
     case "tab.version": return { extensionVersion: version };
     case "page.evaluate": return 2;
     case "page.probe": return { arithmetic: 2, location: "https://fixture.test/", webdriver: false };
+    case "automation.status": return { windowId: 5, tabId: 6, visibility: "visible" };
     default: throw new Error(`Unexpected bridge action: ${action}`);
   }
 }
@@ -44,6 +45,7 @@ function harness({ until, background = true, mode = "server", choices = [], send
     Date: { now: () => now }, PI_CHROME_VERSION: version,
     chromeAuthorizedUntil: until, backgroundEnabled: background,
     hostnameOf: (url) => new URL(url).hostname,
+    sessionKeyFor: () => "session:alpha",
     bridge: {
       status: () => ({ mode }),
       async send(action, params, timeout) {
@@ -128,8 +130,10 @@ test("Doctor includes locked, timed, indefinite, and expired authorization plus 
       assert.match(report, /can run code/);
       assert.match(report, /fixture\.test/);
       assert.deepEqual(h.calls.map(({ action, timeout }) => [action, timeout]), [
-        ["tab.version", 35_000], ["page.evaluate", 10_000], ["page.probe", 10_000],
+        ["tab.version", 35_000], ["page.evaluate", 10_000], ["page.probe", 10_000], ["automation.status", 10_000],
       ]);
+      assert.deepEqual(h.calls.at(-1).params, { sessionKey: "session:alpha", includeVisibility: true });
+      assert.match(report, /Pi's tab is visible/);
       assert.ok(h.calls.filter((call) => call.action.startsWith("page.")).every((call) => call.params.foreground === false));
       assert.equal(h.sandbox.chromeAuthorizedUntil, until, "diagnostics do not grant or change authorization");
       assert.equal(h.sandbox.backgroundEnabled, background);
@@ -157,7 +161,29 @@ test("Doctor retains local state and repair hints when connection/version checks
 test("choosing Doctor explicitly from the dashboard runs full diagnostics", async () => {
   const h = harness({ choices: ["Doctor / troubleshoot"] });
   await h.run();
-  assert.deepEqual(h.calls.map((call) => call.action), ["tab.version", "tab.version", "page.evaluate", "page.probe"]);
+  assert.deepEqual(h.calls.map((call) => call.action), ["tab.version", "tab.version", "page.evaluate", "page.probe", "automation.status"]);
   assert.match(h.notices.at(-1)[0], /Authorization: locked/);
   assert.match(h.notices.at(-1)[0], /Background: on \(hard\)/);
+});
+
+test("Doctor warns when this session's Pi tab is hidden, and stays quiet when it cannot tell", async () => {
+  const withStatus = (status) => (action, ...rest) => action === "automation.status"
+    ? (typeof status === "function" ? status() : status)
+    : healthyResponse(action, ...rest);
+  const hidden = harness({ send: withStatus({ tabId: 6, visibility: "hidden", hiddenReason: "its window is covered by another window" }) });
+  await hidden.run("doctor");
+  const report = hidden.notices.at(-1)[0];
+  assert.match(report, /⚠ Pi's tab is hidden because its window is covered by another window/);
+  assert.match(report, /Chrome ignores clicks and typing in hidden tabs/);
+  assert.match(report, /\/chrome background off/);
+
+  const none = harness({ send: withStatus({ windowId: null, tabId: null }) });
+  await none.run("doctor");
+  assert.match(none.notices.at(-1)[0], /hasn't opened its own tab in this session yet/);
+
+  for (const status of [{ windowId: 5, tabId: 6 }, () => { throw new Error("old extension"); }]) {
+    const quiet = harness({ send: withStatus(status) });
+    await quiet.run("doctor");
+    assert.doesNotMatch(quiet.notices.at(-1)[0], /Pi's tab|own tab/);
+  }
 });

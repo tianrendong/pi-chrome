@@ -4,6 +4,7 @@ All notable user-facing changes to `pi-chrome`.
 
 ## Unreleased
 
+- **`/chrome doctor` flags a hidden Pi tab.** Chrome ignores clicks and typing in hidden pages. Doctor now checks this session's own tab and says whether it is visible. If it's hidden, doctor gives the reason (inactive tab, minimized window, covered by another window) and the fix, instead of the first click or type failing. It never creates or activates a tab to check.
 - **Pi keeps track of its tabs across extension reloads.** Ownership of Pi's automation window and session tabs lived only in `chrome.storage.session`, which Chrome wipes when the extension reloads. The extension reloads itself on every pi-chrome update, so afterwards Pi could not close or reuse the windows and tabs it had opened, and they were left behind. Ownership is now also kept in `chrome.storage.local` and restored after a reload. A restored tab is trusted only if it still exists in the window it was recorded in (adopted tabs must also still be in Pi's group). The copy is dropped on browser startup, since tab ids do not carry over between browser runs.
 
 ## 0.15.56 — 2026-09-28
