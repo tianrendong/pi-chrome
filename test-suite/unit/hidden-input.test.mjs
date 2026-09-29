@@ -277,3 +277,23 @@ test("pruneScreenshotDir deletes only eligible files and never throws", async ()
   assert.equal(await prune.pruneScreenshotDir(path.join(dir, "missing")), 0);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ---- /chrome doctor visibility report ----
+test("automation.status reports whether this session's own tab is visible, without creating one", async () => {
+  const h = worker({ tab: { id: 2, windowId: 1, active: false, url: "https://fixture.test/" }, win: { id: 1, state: "normal" } });
+  h.chrome.scripting.executeScript = async () => [{ result: "hidden" }];
+  const none = await h.w.dispatch("automation.status", { sessionKey: "s", includeVisibility: true });
+  assert.deepEqual(clone(none), { windowId: null, tabId: null });
+  assert.equal(h.calls.some((c) => c.method === "tabs.create" || c.method === "windows.create"), false);
+
+  vm.runInContext("automationTargets.set('s', { tabId: 2, windowId: undefined })", h.w);
+  const hidden = await h.w.dispatch("automation.status", { sessionKey: "s", includeVisibility: true });
+  assert.equal(hidden.visibility, "hidden");
+  assert.match(hidden.hiddenReason, /inactive tab/);
+
+  h.chrome.scripting.executeScript = async () => [{ result: "visible" }];
+  const visible = await h.w.dispatch("automation.status", { sessionKey: "s", includeVisibility: true });
+  assert.equal(visible.visibility, "visible");
+  assert.equal(visible.hiddenReason, undefined);
+  assert.deepEqual(clone(await h.w.dispatch("automation.status", { sessionKey: "s" })), { windowId: null, tabId: 2 }, "plain status is unchanged");
+});
