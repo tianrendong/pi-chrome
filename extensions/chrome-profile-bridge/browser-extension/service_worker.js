@@ -226,17 +226,6 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   return false;
 }
 
-// A new window created while the user's Chrome window is full screen does not become a visible
-// standalone window: macOS either merges it into the full-screen window as a hidden native window
-// tab ("Prefer tabs: in full screen") or places it on another Space. Its page is hidden, so trusted
-// input cannot reach it. Use a grouped background tab in the user's window instead, which is at least
-// visible in the tab strip and does not add a macOS tab bar to the user's full-screen window.
-async function userWindowIsFullscreen() {
-  if (typeof chrome.windows?.getLastFocused !== "function") return false;
-  const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
-  return win?.state === "fullscreen";
-}
-
 // Create a fresh automation target for `sessionKey`. If this session already has a tab group,
 // create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
 // groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
@@ -250,7 +239,7 @@ async function createAutomationTarget(sessionKey, groupTitle) {
     await persistAutomationTargets();
     return tab;
   }
-  if (chrome.windows && typeof chrome.windows.create === "function" && !(await userWindowIsFullscreen())) {
+  if (chrome.windows && typeof chrome.windows.create === "function") {
     try {
       const win = await chrome.windows.create({ url: "about:blank", focused: false });
       const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
@@ -504,7 +493,7 @@ async function pageVisibilityState(tabId) {
 function hiddenTabReason(tab, win) {
   if (win?.state === "minimized") return "its window is minimized";
   if (tab && tab.active === false) return "it is an inactive tab in its window";
-  if (win?.state === "fullscreen") return "its window is behind a full-screen window (on macOS, new windows can become hidden window tabs)";
+  if (win?.state === "fullscreen") return "its window is behind a full-screen window or on another Space";
   return "its window is covered by another window or is on another Space (Chrome treats fully covered windows as hidden)";
 }
 
