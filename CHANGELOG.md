@@ -4,6 +4,8 @@ All notable user-facing changes to `pi-chrome`.
 
 ## Unreleased
 
+- **Pi keeps track of its tabs across extension reloads.** Ownership of Pi's automation window and session tabs lived only in `chrome.storage.session`, which Chrome wipes when the extension reloads. The extension reloads itself on every pi-chrome update, so afterwards Pi could not close or reuse the windows and tabs it had opened, and they were left behind. Ownership is now also kept in `chrome.storage.local` and restored after a reload. A restored tab is trusted only if it still exists in the window it was recorded in (adopted tabs must also still be in Pi's group). The copy is dropped on browser startup, since tab ids do not carry over between browser runs.
+
 ## 0.15.56 — 2026-09-28
 
 - **Pi's automation tab stays in its own window.** Joining the session tab group called `chrome.tabs.group` without a window. Chrome then creates the group in the current window (yours) and moves the tab there, where it sits as an inactive, hidden tab and trusted input is refused. This happened on a session's first page action and is the main source of the hidden-tab errors. New groups are now created in the tab's own window.

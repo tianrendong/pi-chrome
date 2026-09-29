@@ -33,6 +33,11 @@ let polling = false;
 //
 // State is mirrored to chrome.storage.session so a service-worker restart (MV3 can suspend the
 // worker at any time) re-hydrates ownership instead of orphaning the window it already created.
+// storage.session is also cleared when the extension reloads, which it does itself on every
+// pi-chrome version bump, so ownership is mirrored to chrome.storage.local too (see
+// readOwnership). The local copy is restored only when the session copy is missing, every restored
+// tab is re-checked, and the local copy is dropped on browser startup because tab ids do not carry
+// over between browser runs.
 // storage.session is cleared on browser restart; any window restored by Chrome's session-restore
 // is then untracked and simply left alone (we only ever close ids we still recognize as ours).
 const automationTargets = new Map(); // sessionKey -> { windowId?: number, tabId: number }
@@ -50,6 +55,36 @@ function sessionKeyOf(params) {
     : DEFAULT_SESSION_KEY;
 }
 
+// Read an ownership record: the storage.session copy if present, else the storage.local copy
+// (after an extension reload). Returns { value, restored } where restored marks a local copy.
+async function readOwnership(key) {
+  const fromSession = await chrome.storage?.session?.get?.(key).catch(() => null);
+  if (fromSession && fromSession[key] && typeof fromSession[key] === "object") return { value: fromSession[key], restored: false };
+  const fromLocal = await chrome.storage?.local?.get?.(key).catch(() => null);
+  if (fromLocal && fromLocal[key] && typeof fromLocal[key] === "object") return { value: fromLocal[key], restored: true };
+  return { value: null, restored: false };
+}
+
+async function writeOwnership(key, value) {
+  await Promise.all([
+    Promise.resolve(chrome.storage?.session?.set?.({ [key]: value })).catch(() => {}),
+    Promise.resolve(chrome.storage?.local?.set?.({ [key]: value })).catch(() => {}),
+  ]);
+}
+
+// A restored (local) record is trusted only if its tab still exists in the window it was recorded
+// in. Anything else is forgotten, so a reused id or a tab the user moved is never closed by Pi.
+async function restoredTabStillOurs(tabId, windowId) {
+  if (!Number.isInteger(tabId) || tabId < 0 || !Number.isInteger(windowId)) return null;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  return tab && tab.windowId === windowId ? tab : null;
+}
+
+async function tabWindowId(tabId) {
+  const tab = Number.isInteger(tabId) ? await chrome.tabs.get(tabId).catch(() => null) : null;
+  return Number.isInteger(tab?.windowId) ? tab.windowId : undefined;
+}
+
 // Re-hydrate the in-memory ownership map from storage.session once per worker lifetime. Best
 // effort: storage may be unavailable on old Chrome, and a failure just means we may create a
 // fresh window (a harmless orphan) rather than reusing one.
@@ -57,17 +92,19 @@ async function hydrateAutomationTargets() {
   if (automationHydrated) return automationHydrated;
   automationHydrated = (async () => {
     try {
-      const stored = await chrome.storage?.session?.get?.(AUTOMATION_STORAGE_KEY);
-      const saved = stored && stored[AUTOMATION_STORAGE_KEY];
+      const { value: saved, restored } = await readOwnership(AUTOMATION_STORAGE_KEY);
       if (saved && typeof saved === "object") {
         for (const [key, value] of Object.entries(saved)) {
-          if (value && typeof value.tabId === "number") {
-            automationTargets.set(key, {
-              windowId: typeof value.windowId === "number" ? value.windowId : undefined,
-              tabId: value.tabId,
-            });
-          }
+          if (!value || typeof value.tabId !== "number") continue;
+          const tabWindow = typeof value.tabWindowId === "number" ? value.tabWindowId : undefined;
+          if (restored && !(await restoredTabStillOurs(value.tabId, tabWindow))) continue;
+          automationTargets.set(key, {
+            windowId: typeof value.windowId === "number" ? value.windowId : undefined,
+            tabId: value.tabId,
+            tabWindowId: tabWindow,
+          });
         }
+        if (restored) await persistAutomationTargets();
       }
     } catch {
       // Ignore: treat as "no persisted state".
@@ -79,19 +116,28 @@ async function hydrateAutomationTargets() {
 async function hydrateSessionTabs() {
   if (!sessionTabsReady) sessionTabsReady = (async () => {
     try {
-      const stored = await chrome.storage?.session?.get?.(SESSION_TABS_STORAGE_KEY);
-      for (const [key, entries] of Object.entries(stored?.[SESSION_TABS_STORAGE_KEY] || {})) {
+      const { value: saved, restored } = await readOwnership(SESSION_TABS_STORAGE_KEY);
+      for (const [key, entries] of Object.entries(saved || {})) {
         if (!Array.isArray(entries)) continue;
         const tabs = new Map();
         for (const entry of entries) {
           if (!entry || !Number.isInteger(entry.tabId) || entry.tabId < 0) continue;
-          if (entry.created === true) tabs.set(entry.tabId, { created: true });
+          const windowId = Number.isInteger(entry.windowId) ? entry.windowId : undefined;
+          let tab = null;
+          if (restored) {
+            tab = await restoredTabStillOurs(entry.tabId, windowId);
+            if (!tab) continue;
+          }
+          if (entry.created === true) tabs.set(entry.tabId, { created: true, windowId });
           else if (entry.created === false && Number.isInteger(entry.groupId) && entry.groupId >= 0) {
-            tabs.set(entry.tabId, { created: false, groupId: entry.groupId });
+            // An adopted tab must also still be in the group Pi put it in.
+            if (restored && tab.groupId !== entry.groupId) continue;
+            tabs.set(entry.tabId, { created: false, groupId: entry.groupId, windowId });
           }
         }
         if (tabs.size) sessionTabs.set(key, tabs);
       }
+      if (restored) await persistSessionTabs();
     } catch {
       // Missing ownership must leave tabs alone, not guess ownership from group names.
     }
@@ -105,7 +151,7 @@ function persistSessionTabs() {
     const saved = Object.fromEntries([...sessionTabs].map(([key, tabs]) => [
       key, [...tabs].map(([tabId, record]) => ({ tabId, ...record })),
     ]));
-    await chrome.storage?.session?.set?.({ [SESSION_TABS_STORAGE_KEY]: saved });
+    await writeOwnership(SESSION_TABS_STORAGE_KEY, saved);
   }).catch(() => {});
   return sessionTabsWrite;
 }
@@ -119,7 +165,8 @@ async function trackSessionTab(sessionKey, tabId, created, groupId) {
   }
   let tabs = sessionTabs.get(sessionKey);
   if (!tabs) sessionTabs.set(sessionKey, tabs = new Map());
-  tabs.set(tabId, created ? { created: true } : { created: false, groupId });
+  const windowId = await tabWindowId(tabId);
+  tabs.set(tabId, created ? { created: true, windowId } : { created: false, groupId, windowId });
   await persistSessionTabs();
 }
 
@@ -153,9 +200,14 @@ async function persistAutomationTargets() {
   try {
     const obj = {};
     for (const [key, value] of automationTargets) {
-      obj[key] = { windowId: typeof value.windowId === "number" ? value.windowId : null, tabId: value.tabId };
+      if (typeof value.tabWindowId !== "number") value.tabWindowId = await tabWindowId(value.tabId);
+      obj[key] = {
+        windowId: typeof value.windowId === "number" ? value.windowId : null,
+        tabId: value.tabId,
+        tabWindowId: typeof value.tabWindowId === "number" ? value.tabWindowId : null,
+      };
     }
-    await chrome.storage?.session?.set?.({ [AUTOMATION_STORAGE_KEY]: obj });
+    await writeOwnership(AUTOMATION_STORAGE_KEY, obj);
   } catch {
     // Ignore: persistence is an optimization, not a correctness requirement.
   }
@@ -1537,6 +1589,8 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  // A new browser run: tab ids from the last run mean nothing now.
+  Promise.resolve(chrome.storage?.local?.remove?.([AUTOMATION_STORAGE_KEY, SESSION_TABS_STORAGE_KEY])).catch(() => {});
   armKeepaliveAlarm();
   void pollLoop();
 });
