@@ -1808,7 +1808,7 @@
       "Open the challenge in an inactive tab. Do not select it after arming."
     ],
     "recipe": [
-      { "tool": "chrome_evaluate", "params": { "urlIncludes": "/45-background-fill.html", "expression": "armBackgroundFill(); window.expectedDraft" } },
+      { "tool": "chrome_evaluate", "params": { "urlIncludes": "/45-background-fill.html", "expression": "(() => { armBackgroundFill(); return window.expectedDraft; })()" } },
       { "tool": "chrome_fill", "params": { "urlIncludes": "/45-background-fill.html", "selector": "#editor", "text": "$DRAFT", "domFallback": false, "includeSnapshot": true } },
       { "tool": "chrome_evaluate", "params": { "urlIncludes": "/45-background-fill.html", "expression": "gradeBackgroundFill()" } }
     ],
