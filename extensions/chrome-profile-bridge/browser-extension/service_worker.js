@@ -1256,6 +1256,37 @@ async function domFillFallback(tabId, params, cause) {
   return { input: "dom-fallback", length: String(params.text || "").length, valueMatches: v?.valueMatches, reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
 }
 
+// Hidden tabs can accept native bulk insertion even when pointer and key events
+// are dropped. Resolve the same editing host for selection and for read-back.
+async function hiddenFillEditor(tabId, params, select) {
+  const results = await executeScriptWithFallback({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid, text, select) => {
+      const el = uid ? window.__PI_CHROME_STATE__?.elements?.[uid] : document.querySelector(selector);
+      if (uid && !el?.isConnected) throw new Error(`snapshot uid ${uid} is stale; refresh chrome_snapshot`);
+      if (!el?.isContentEditable || el.parentElement?.isContentEditable) return false;
+      if (!select) {
+        const normalize = (value) => value.replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ");
+        return normalize(el.innerText) === normalize(text);
+      }
+      el.focus({ preventScroll: true });
+      if (!el.isConnected || document.activeElement !== el) {
+        throw new Error("chrome.fill: requested contenteditable is not focused");
+      }
+      const selection = window.getSelection();
+      if (!selection) throw new Error("chrome.fill: could not select contenteditable contents");
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    },
+    args: [params.selector ?? null, params.uid ?? null, String(params.text ?? ""), select],
+  }, `check background editor in tab ${tabId}`);
+  return results?.[0]?.result === true;
+}
+
 async function chromeInputFill(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
@@ -1288,6 +1319,18 @@ async function chromeInputFill(params) {
     if (params.submit) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
     return { input: "chrome", length: text.length, typing };
   } catch (error) {
+    const text = String(params.text ?? "");
+    if (error.hiddenTab && !foregroundRequested(params) && text && !params.perCharacter && !params.submit &&
+        (params.uid || params.selector) && await hiddenFillEditor(tab.id, params, true)) {
+      // This is a single replacement, not Delete followed by insert. Do not
+      // retry a write on detach or fall through to a DOM edit on failed read-back.
+      await cdpRaw(tab.id, "Input.insertText", { text });
+      await sleep(100);
+      if (!await hiddenFillEditor(tab.id, params, false)) {
+        throw new Error("chrome.fill: the background editor did not retain the requested text");
+      }
+      return { input: "chrome", length: text.length, typing: "insertText", valueMatches: true };
+    }
     if (params.domFallback === false) throw error;
     return domFillFallback(tab.id, params, error);
   }

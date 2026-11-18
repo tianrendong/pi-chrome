@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>45 background fill</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<main>
+  <h1>Replace a rich-text draft without activating the tab</h1>
+  <p>Open this page in an inactive tab. Arm the probe, fill the editor with
+    <code>window.expectedDraft</code>, and read <code>gradeBackgroundFill()</code>
+    without selecting the tab. Keep hard background mode on.</p>
+  <div id="editor" aria-label="Draft" role="textbox" contenteditable="true"
+       style="white-space: pre-wrap; min-height: 4em; border: 1px solid">Old draft</div>
+</main>
+<script>
+Challenge.init({ id: "background-fill", instructions: "inactive tab → arm → fill → grade without activation" });
+const editor = document.querySelector("#editor");
+const renderedText = () => editor.innerText.replace(/\u00a0/g, " ");
+let armed = false;
+let draft = renderedText();
+let sawTrustedInput = false;
+window.expectedDraft = "New draft: café <b>literal</b>\nSecond line";
+window.armBackgroundFill = () => {
+  if (armed || !document.hidden) throw new Error("Open an inactive tab and arm once per load");
+  armed = true;
+  return document.visibilityState;
+};
+document.addEventListener("visibilitychange", () => {
+  if (armed && !document.hidden) Challenge.fail("Target became visible");
+});
+editor.addEventListener("input", (event) => {
+  if (!armed) return;
+  if (event.isTrusted) {
+    sawTrustedInput = true;
+    draft = renderedText();
+  } else {
+    // Model a controlled editor that rejects DOM writes on reconciliation.
+    queueMicrotask(() => { editor.textContent = draft; });
+  }
+});
+window.gradeBackgroundFill = () => {
+  if (!armed || !document.hidden) Challenge.fail("Target must stay hidden after arming");
+  // A single multiline insertText can emit several native input events.
+  if (!sawTrustedInput) Challenge.fail("No trusted input reached the editor");
+  if (draft !== window.expectedDraft || renderedText() !== draft || editor.querySelector("b")) {
+    Challenge.fail("The whole draft was not replaced with the expected plain text");
+  }
+  Challenge.pass("Verified native replacement while the tab remained hidden");
+  return { verdict: window.__verdict, reasons: window.__reason };
+};
+</script>

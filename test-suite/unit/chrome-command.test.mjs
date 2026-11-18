@@ -174,7 +174,8 @@ test("Doctor warns when this session's Pi tab is hidden, and stays quiet when it
   await hidden.run("doctor");
   const report = hidden.notices.at(-1)[0];
   assert.match(report, /⚠ Pi's tab is hidden because its window is covered by another window/);
-  assert.match(report, /Chrome ignores clicks and typing in hidden tabs/);
+  assert.match(report, /Chrome can drop pointer and key input in hidden tabs/);
+  assert.match(report, /Bulk chrome_fill may still work in a rich-text editor/);
   assert.match(report, /\/chrome background off/);
 
   const none = harness({ send: withStatus({ windowId: null, tabId: null }) });

@@ -59,7 +59,7 @@ The existing background setting is a hard session policy, enabled by default. No
 - All worker window-focus/tab-activation writes go through a guarded helper. Background tab creation uses `active:false`; implicit automation windows remain `focused:false`.
 - Screenshots use CDP `Page.captureScreenshot` with `fromSurface:true` and `captureBeyondViewport:false`. They target a tab, not whichever tab happens to be visible. There is no `captureVisibleTab`/activation fallback on debugger or capture failure. PNG/JPEG output is unchanged; full-page capture retains tiles plus a JSON manifest and restores scroll position best-effort, including on failure.
 - Background tab creation and screenshots use internal `tab.new.background` / `page.screenshot.background` wire actions. Old companions reject them before changing tabs; Pi reports a reload instruction instead of retrying an unsafe legacy action. No capability-probe race or extra round trip is needed.
-- Real CDP input and existing explicit DOM-fallback controls are unchanged. Background mode never silently substitutes synthetic input to avoid focus.
+- Hidden rich-text editors support native bulk replacement via `chrome_fill`. The worker selects the editing host's contents in-page, sends one `Input.insertText`, then checks the rendered text after a short settling delay. No window/tab activation or pointer/key events are used. Failed or unverified native writes are not retried via DOM fallback. Empty fills, submission and per-character input do not use this path.
 
 ### Scope and risks
 

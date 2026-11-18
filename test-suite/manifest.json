@@ -1794,5 +1794,30 @@
     "flakeRisk": "low",
     "manualBaseline": "unverified",
     "gradeSource": "page"
+  },
+  {
+    "id": "background-fill",
+    "file": "challenges/45-background-fill.html",
+    "category": "editing",
+    "difficulty": "L2",
+    "gate": "conditional",
+    "goal": "Replace the full rich-text draft with one native edit in an inactive tab.",
+    "expected": { "synthetic": "FAIL", "trusted": "PASS", "manual": "FAIL" },
+    "prerequisites": [
+      "Reload the updated Chrome companion. Keep /chrome background on.",
+      "Open the challenge in an inactive tab. Do not select it after arming."
+    ],
+    "recipe": [
+      { "tool": "chrome_evaluate", "params": { "urlIncludes": "/45-background-fill.html", "expression": "armBackgroundFill(); window.expectedDraft" } },
+      { "tool": "chrome_fill", "params": { "urlIncludes": "/45-background-fill.html", "selector": "#editor", "text": "$DRAFT", "domFallback": false, "includeSnapshot": true } },
+      { "tool": "chrome_evaluate", "params": { "urlIncludes": "/45-background-fill.html", "expression": "gradeBackgroundFill()" } }
+    ],
+    "requires": { "cdp": true },
+    "tags": ["background", "contenteditable", "insertText"],
+    "notes": [
+      "Use the first evaluation result as $DRAFT. With the old companion, leave DOM fallback enabled to observe the controlled editor reverting the synthetic fill.",
+      "Tab visibility is graded; OS focus and covered windows require a separate live check. Manual FAIL is intentional because selecting the target breaks the visibility criterion."
+    ],
+    "gradeSource": "page"
   }
 ]

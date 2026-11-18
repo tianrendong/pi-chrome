@@ -1,6 +1,6 @@
 // Hidden-tab input guard, full-screen automation targets, input.debug without a target, upload
 // targets (label/wrapper/iframe/file-chooser), and screenshot pruning. Chrome and pages are mocked;
-// the hidden-page behavior itself (Chrome drops trusted input) was measured live on Chrome/macOS.
+// pointer/key drops and native bulk replacement on hidden pages were measured on Chrome/macOS.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -88,6 +88,84 @@ test("click and fill use their DOM fallback immediately for hidden tabs, or reje
   assert.match(filled.reason, /hidden/);
   assert.equal(fill.inputs().length, 0);
 });
+
+function hiddenEditor({ redirectFocus = false, revertEdit = false, insertionFails = false } = {}) {
+  const h = worker({ visibility: ["hidden"] });
+  const document = {
+    activeElement: null,
+    querySelector: (selector) => selector === "#editor" ? editor : null,
+    createRange: () => ({ selectNodeContents: (node) => { selected = node; } }),
+  };
+  const editor = {
+    isConnected: true, isContentEditable: true, innerText: "old draft", tagName: "DIV",
+    focus: () => { document.activeElement = redirectFocus ? {} : editor; },
+  };
+  let selected;
+  h.w.document = document;
+  h.w.window = { __PI_CHROME_STATE__: { elements: { "el-1": editor } }, getSelection: () => ({ removeAllRanges() {}, addRange() {} }) };
+  h.chrome.scripting.executeScript = async ({ func, args }) => [{ result: vm.runInNewContext(`(${func})(...args)`, { document, window: h.w.window, args }) }];
+  h.w.cdpRaw = async (_tabId, method, params) => {
+    h.calls.push({ method, params });
+    assert.equal(method, "Input.insertText");
+    assert.equal(document.activeElement, editor, "Do not type into a different field");
+    assert.equal(selected, editor, "Replace the old draft instead of appending");
+    editor.innerText = params.text;
+    if (insertionFails) throw new Error("transport error after input");
+  };
+  h.w.sleep = async () => { if (revertEdit) editor.innerText = "old draft"; };
+  h.w.domFillFallback = async () => { assert.fail("Must not retry the edit with DOM fallback"); };
+  return { ...h, editor };
+}
+
+for (const target of [{ selector: "#editor" }, { uid: "el-1" }]) {
+  test(`hidden rich editor (${Object.keys(target)[0]}) uses native replacement without activating the tab`, async () => {
+    const h = hiddenEditor();
+    const result = await h.w.dispatch("page.fill", { ...target, text: "new draft", background: true, foreground: true, domFallback: false });
+    assert.equal(h.editor.innerText, "new draft");
+    assert.equal(result.input, "chrome");
+    assert.equal(result.valueMatches, true);
+    assert.deepEqual(h.inputs().map((c) => c.method), ["Input.insertText"]);
+  });
+}
+
+test("hidden fill reports an editor that discards input without retrying the edit", async () => {
+  const h = hiddenEditor({ revertEdit: true });
+  await assert.rejects(h.w.dispatch("page.fill", { selector: "#editor", text: "new draft", background: true }), /did not retain/);
+  assert.equal(h.editor.innerText, "old draft");
+  assert.equal(h.inputs().length, 1);
+});
+
+test("hidden fill does not insert when focus is redirected", async () => {
+  const h = hiddenEditor({ redirectFocus: true });
+  await assert.rejects(h.w.dispatch("page.fill", { selector: "#editor", text: "new draft", background: true }), /requested contenteditable is not focused/);
+  assert.equal(h.inputs().length, 0);
+});
+
+test("an insertion error is surfaced without retrying a possibly applied edit", async () => {
+  const h = hiddenEditor({ insertionFails: true });
+  await assert.rejects(h.w.dispatch("page.fill", { selector: "#editor", text: "new draft", background: true }), /transport error after input/);
+  assert.equal(h.inputs().length, 1);
+});
+
+test("hidden fill rejects a stale UID even when a selector still matches", async () => {
+  const h = hiddenEditor();
+  await assert.rejects(h.w.dispatch("page.fill", {
+    uid: "stale", selector: "#editor", text: "new draft", background: true,
+  }), /snapshot uid stale is stale/);
+  assert.equal(h.editor.innerText, "old draft");
+  assert.equal(h.inputs().length, 0);
+});
+
+for (const extra of [{ perCharacter: true }, { submit: true }, { text: "" }]) {
+  test(`hidden fill preserves the strict guard for ${Object.keys(extra)[0]}`, async () => {
+    const h = hiddenEditor();
+    await assert.rejects(h.w.dispatch("page.fill", {
+      selector: "#editor", text: "new draft", background: true, domFallback: false, ...extra,
+    }), /is hidden/);
+    assert.equal(h.editor.innerText, "old draft");
+    assert.equal(h.inputs().length, 0);
+  });
+}
 
 test("hidden reasons distinguish minimized and macOS full-screen windows", async () => {
   const minimized = worker({ visibility: ["hidden"], win: { id: 1, state: "minimized" } });
