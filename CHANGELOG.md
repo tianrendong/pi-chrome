@@ -4,6 +4,8 @@ All notable user-facing changes to `pi-chrome`.
 
 ## Unreleased
 
+- **Fill hidden rich-text editors without activating their tabs.** For nonempty `chrome_fill` calls without `perCharacter` or `submit`, use one native replacement and check that the editor kept the text. A failed or unverified native edit is not silently retried with DOM writes.
+
 ## 0.15.57 — 2026-09-28
 
 - **Pi gets its own window again while your Chrome is full screen.** 0.15.54 put Pi's tab in your window during full screen, assuming macOS would merge a new window into yours as a hidden window tab. Chrome disables macOS automatic window tabbing (`chrome/browser/app_controller_mac.mm`), so that never happens. The hidden tabs seen at the time came from the tab-group bug fixed in 0.15.56. A new window opened during full screen lands on another Space, and a tab in your window is just as hidden, so the special case only cost isolation.

@@ -1145,7 +1145,7 @@ Capability model (important):
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly. If the action started a navigation, the snapshot waits (up to 5s) for the new page.
 - \`chrome_type\` never replaces: with a uid/selector it appends at the end of the field; without one it types at the current caret. Check its before/after report. Use \`chrome_fill\` to replace a field.
-- Chrome ignores real input to hidden pages (inactive tabs, minimized windows, windows behind a macOS full-screen window). Input tools report this instead of silently doing nothing; retry with background:false only when bringing the tab forward is acceptable.
+- Chrome can ignore pointer and key events in hidden pages. For bulk replacement in a rich-text editor, use \`chrome_fill\` without perCharacter or submit; it can insert native text in a hidden tab and check that the editor kept it. Retry other blocked input with background:false only when bringing the tab forward is acceptable.
 - \`chrome_cdp\` runs any raw CDP method on a tab (emulation, cookies, PDF, accessibility tree, etc.) when no dedicated chrome_* tool fits; \`chrome_cdp_targets\` diagnoses debugger/overlay conflicts.
 
 Usage rules:
@@ -1229,7 +1229,7 @@ Usage rules:
 						lines.push(`• Pi hasn't opened its own tab in this session yet.`);
 					} else if (own.visibility === "hidden") {
 						lines.push(
-							`⚠ Pi's tab is hidden because ${own.hiddenReason ?? "its window is not visible"}. Chrome ignores clicks and typing in hidden tabs, so those tools will fail until it's visible.`,
+							`⚠ Pi's tab is hidden because ${own.hiddenReason ?? "its window is not visible"}. Chrome can drop pointer and key input in hidden tabs. Bulk chrome_fill may still work in a rich-text editor without activating the tab.`,
 							`  Fix: bring Pi's window forward or uncover it, or run /chrome background off to let Pi bring it forward.`,
 						);
 					} else if (own.visibility === "visible") {
@@ -1782,7 +1782,7 @@ Usage rules:
 		name: "chrome_fill",
 		label: "Chrome Fill",
 		description:
-			"Replace the whole value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. Unlike chrome_type, existing contents are cleared first. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
+			"Replace the whole value of a text input, textarea, or contenteditable. For a hidden contenteditable editing host, nonempty bulk fills without perCharacter or submit try one native replacement and report an error if the editor does not retain it, without activating the tab. On visible pages, perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true for a fresh snapshot.",
 		promptSnippet: "Fill a Chrome form field by snapshot uid or selector, optionally returning a fresh snapshot.",
 		parameters: Type.Object({
 			text: Type.String(),
@@ -1790,7 +1790,7 @@ Usage rules:
 			selector: Type.Optional(Type.String({ description: "CSS selector to fill if uid is omitted." })),
 			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
 			submit: Type.Optional(Type.Boolean({ description: "If true, press Enter after filling." })),
-			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked (extension overlay, debugger failure, or a hidden tab that ignores trusted input)." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), allow DOM value-setting when native input is unavailable. This does not retry a background native replacement that may have already edited the field." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after filling." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),
